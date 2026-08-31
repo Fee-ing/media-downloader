@@ -1,4 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
+import { requireOptionalNativeModule } from 'expo-modules-core';
+import { Platform } from 'react-native';
 
 import { DESKTOP_UA } from '../constants';
 import type { MediaItem } from '../types';
@@ -80,19 +82,26 @@ export async function downloadMedia(
 /**
  * 保存到相册，失败时降级为系统分享（用户可自行存储）。
  *
- * 依赖按需 require：部分运行环境（如未预构建原生模块的 Expo Go）
- * 不存在 `ExpoMediaLibraryNext` 原生模块，静态 import 会在 App 启动阶段直接崩溃。
+ * SDK 57 的 `expo-media-library` 在主入口顶层即通过 `requireNativeModule('ExpoMediaLibraryNext')`
+ * 加载原生模块；在缺少该模块的环境（web、与 SDK 版本不匹配的 Expo Go、未重新构建的 dev client）
+ * 中，即使按需 `require` 也会在模块加载时直接抛错。因此这里先用 `requireOptionalNativeModule`
+ * 预检原生模块是否存在，缺失时直接跳过相册保存，避免崩溃。
  */
 export async function saveToGallery(uri: string): Promise<SaveResult> {
-  try {
-    const MediaLibrary = require('expo-media-library');
-    const permission = await MediaLibrary.requestPermissionsAsync(true);
-    if (permission?.granted && MediaLibrary.Asset?.create) {
-      await MediaLibrary.Asset.create(uri);
-      return 'gallery';
+  const hasNativeMediaLibrary =
+    Platform.OS !== 'web' && requireOptionalNativeModule('ExpoMediaLibraryNext') != null;
+
+  if (hasNativeMediaLibrary) {
+    try {
+      const MediaLibrary = require('expo-media-library');
+      const permission = await MediaLibrary.requestPermissionsAsync(true);
+      if (permission?.granted && MediaLibrary.Asset?.create) {
+        await MediaLibrary.Asset.create(uri);
+        return 'gallery';
+      }
+    } catch (error) {
+      console.warn('[downloader] 保存到相册失败，尝试降级：', error);
     }
-  } catch (error) {
-    console.warn('[downloader] 保存到相册失败，尝试降级：', error);
   }
 
   try {

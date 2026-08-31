@@ -297,6 +297,400 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
   };
 }
 
+// ============================================================
+// 容器分辨率解析（渐进式视频直链）
+// ============================================================
+
+const CONTAINER_HEAD_BYTES = 256 * 1024; // 头部读取量（覆盖绝大多数 moov 在前的 MP4）
+const CONTAINER_TAIL_BYTES = 256 * 1024; // 尾部读取量（moov 未 faststart 优化时在文件尾）
+const WEBM_HEAD_BYTES = 512 * 1024; // WebM/MKV 的 Tracks 通常在文件头部
+
+function isPlausibleBoxSize(size: number): boolean {
+  return size === 0 || size === 1 || (size >= 8 && size <= 0x7fffffff);
+}
+
+function readU16(data: Uint8Array, offset: number): number {
+  return (data[offset] << 8) | data[offset + 1];
+}
+
+function readU32(data: Uint8Array, offset: number): number {
+  return (
+    ((data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]) >>>
+    0
+  );
+}
+
+function readU64(data: Uint8Array, offset: number): number {
+  const hi = readU32(data, offset);
+  const lo = readU32(data, offset + 4);
+  if (hi > 0x1fffff) return Number.MAX_SAFE_INTEGER; // 超出 JS 安全整数范围
+  return hi * 4294967296 + lo;
+}
+
+function readI32Fixed16(data: Uint8Array, offset: number): number {
+  return (readU32(data, offset) | 0) / 65536;
+}
+
+function boxTypeAt(data: Uint8Array, offset: number): string {
+  if (offset + 4 > data.length) return '';
+  return String.fromCharCode(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
+}
+
+/** 在指定区间内遍历查找所有指定类型的 box（box 边界精确对齐） */
+function findBoxes(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  type: string,
+): Array<{ start: number; end: number }> {
+  const boxes: Array<{ start: number; end: number }> = [];
+  let offset = start;
+  while (offset + 8 <= end) {
+    const size32 = readU32(data, offset);
+    if (!isPlausibleBoxSize(size32)) break;
+    let headerSize = 8;
+    let boxEnd = offset + size32;
+    if (size32 === 1) {
+      if (offset + 16 > end) break;
+      const size64 = readU64(data, offset + 8);
+      if (size64 < 16) break;
+      headerSize = 16;
+      boxEnd = offset + size64;
+    } else if (size32 === 0) {
+      boxEnd = end;
+    }
+    if (boxEnd > end || boxEnd <= offset) break;
+    if (boxTypeAt(data, offset + 4) === type) {
+      boxes.push({ start: offset + headerSize, end: boxEnd });
+    }
+    offset = boxEnd;
+  }
+  return boxes;
+}
+
+/** 在指定区间内查找第一个指定类型的 box（box 边界精确对齐） */
+function findBox(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  type: string,
+): { start: number; end: number } | null {
+  const boxes = findBoxes(data, start, end, type);
+  return boxes.length ? boxes[0] : null;
+}
+
+/** 容错定位 box：数据可能从中途开始（头尾拼接/截断），扫描类型标记并校验 size */
+function findBoxTolerant(
+  data: Uint8Array,
+  type: string,
+): { start: number; end: number } | null {
+  const c0 = type.charCodeAt(0);
+  const c1 = type.charCodeAt(1);
+  const c2 = type.charCodeAt(2);
+  const c3 = type.charCodeAt(3);
+  for (let i = 4; i + 4 <= data.length; i++) {
+    if (data[i] !== c0 || data[i + 1] !== c1 || data[i + 2] !== c2 || data[i + 3] !== c3) {
+      continue;
+    }
+    const size32 = readU32(data, i - 4);
+    if (size32 === 1) {
+      if (i + 8 <= data.length) {
+        const size64 = readU64(data, i);
+        if (size64 >= 16 && i - 4 + size64 <= data.length) {
+          return { start: i + 8, end: i - 4 + size64 };
+        }
+      }
+      continue;
+    }
+    if (size32 === 0) return { start: i + 4, end: data.length };
+    if (size32 >= 8 && i - 4 + size32 <= data.length) {
+      return { start: i + 4, end: i - 4 + size32 };
+    }
+  }
+  return null;
+}
+
+/** 视频 sample entry 格式白名单（用于跳过音轨/字幕轨） */
+const VIDEO_SAMPLE_ENTRY_RE =
+  /^(avc1|avc2|avc3|avc4|hvc1|hev1|hvc2|vp08|vp09|av01|mp4v|encv|dvhe|dvc1|dvh1|h263|s263|mjpa|mjpb|jpeg|jpgv)$/i;
+
+/** 从 stsd 的视频 sample entry 读取视觉尺寸（编码分辨率） */
+function parseStsdVideoEntry(
+  data: Uint8Array,
+  start: number,
+  end: number,
+): { width: number; height: number } | null {
+  if (end - start < 8) return null;
+  const entryCount = readU32(data, start + 4);
+  let offset = start + 8;
+  for (let i = 0; i < entryCount && offset + 8 <= end; i++) {
+    const size = readU32(data, offset);
+    if (!isPlausibleBoxSize(size) || size === 1 || size === 0) break;
+    if (offset + 36 <= end) {
+      const format = boxTypeAt(data, offset + 4);
+      if (VIDEO_SAMPLE_ENTRY_RE.test(format)) {
+        // VisualSampleEntry 的宽高位于 entry 起点偏移 32 处
+        const width = readU16(data, offset + 32);
+        const height = readU16(data, offset + 34);
+        if (width > 0 && height > 0 && width <= 16384 && height <= 16384) {
+          return { width, height };
+        }
+      }
+    }
+    offset += size;
+  }
+  return null;
+}
+
+/** 从 tkhd 读取展示尺寸，并应用旋转（90°/270°）修正 */
+function parseTkhd(
+  data: Uint8Array,
+  start: number,
+  end: number,
+): { width: number; height: number } | null {
+  if (end - start < 4) return null;
+  const version = data[start] & 0xff;
+  const base = start + 4 + (version === 1 ? 32 : 20) + 16;
+  if (base + 44 > end) return null;
+  const matrix = base;
+  const a = readI32Fixed16(data, matrix);
+  const b = readI32Fixed16(data, matrix + 4);
+  const c = readI32Fixed16(data, matrix + 8);
+  const d = readI32Fixed16(data, matrix + 12);
+  let width = readU32(data, base + 36) >>> 16; // 16.16 定点数取整
+  let height = readU32(data, base + 40) >>> 16;
+  if (
+    Math.abs(a) < 0.5 &&
+    Math.abs(d) < 0.5 &&
+    (Math.abs(b) > 0.5 || Math.abs(c) > 0.5)
+  ) {
+    const tmp = width;
+    width = height;
+    height = tmp;
+  }
+  if (width > 0 && height > 0 && width <= 16384 && height <= 16384) {
+    return { width, height };
+  }
+  return null;
+}
+
+/** 解析 ISO BMFF（MP4/MOV/M4V）容器分辨率 */
+function parseIsoBmffResolution(data: Uint8Array): { width: number; height: number } | null {
+  const moov = findBoxTolerant(data, 'moov');
+  if (!moov) return null;
+  const traks = findBoxes(data, moov.start, moov.end, 'trak');
+  // 1) stsd 视频 sample entry（编码分辨率，最准确）
+  for (let i = 0; i < traks.length; i++) {
+    const mdia = findBox(data, traks[i].start, traks[i].end, 'mdia');
+    if (!mdia) continue;
+    const minf = findBox(data, mdia.start, mdia.end, 'minf');
+    if (!minf) continue;
+    const stbl = findBox(data, minf.start, minf.end, 'stbl');
+    if (!stbl) continue;
+    const stsd = findBox(data, stbl.start, stbl.end, 'stsd');
+    if (!stsd) continue;
+    const dim = parseStsdVideoEntry(data, stsd.start, stsd.end);
+    if (dim) return dim;
+  }
+  // 2) tkhd 展示尺寸（含旋转修正）
+  for (let i = 0; i < traks.length; i++) {
+    const tkhd = findBox(data, traks[i].start, traks[i].end, 'tkhd');
+    if (!tkhd) continue;
+    const dim = parseTkhd(data, tkhd.start, tkhd.end);
+    if (dim) return dim;
+  }
+  return null;
+}
+
+function readEbmlId(data: Uint8Array, offset: number): { value: number; size: number } | null {
+  const first = data[offset];
+  if (!first) return null;
+  let len = 0;
+  for (let i = 0; i < 4; i++) {
+    if (first & (0x80 >> i)) {
+      len = i + 1;
+      break;
+    }
+  }
+  if (!len || offset + len > data.length) return null;
+  let value = 0;
+  for (let i = 0; i < len; i++) value = value * 256 + data[offset + i];
+  return { value, size: len };
+}
+
+function readEbmlSize(data: Uint8Array, offset: number): { value: number; size: number } | null {
+  const first = data[offset];
+  if (!first) return null;
+  let len = 0;
+  for (let i = 0; i < 8; i++) {
+    if (first & (0x80 >> i)) {
+      len = i + 1;
+      break;
+    }
+  }
+  if (!len || offset + len > data.length) return null;
+  let value = first & (0x7f >> (len - 1));
+  for (let i = 1; i < len; i++) {
+    value = value * 256 + data[offset + i];
+    if (value > 0x1fffffffffffff) break; // 超长视为 unknown size
+  }
+  return { value, size: len };
+}
+
+function walkEbml(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  visit: (id: number, s: number, e: number) => void,
+) {
+  let offset = start;
+  while (offset + 2 <= end) {
+    const id = readEbmlId(data, offset);
+    if (!id) break;
+    const size = readEbmlSize(data, offset + id.size);
+    if (!size) break;
+    const contentStart = offset + id.size + size.size;
+    if (contentStart > end) break;
+    if (size.value > end - contentStart) {
+      // unknown size（live 流常见）：元素延伸到数据末尾
+      visit(id.value, contentStart, end);
+      break;
+    }
+    const contentEnd = contentStart + size.value;
+    visit(id.value, contentStart, contentEnd);
+    offset = contentEnd;
+  }
+}
+
+function readEbmlUint(data: Uint8Array, start: number, end: number): number {
+  let value = 0;
+  for (let i = start; i < end && i < data.length; i++) {
+    value = value * 256 + data[i];
+    if (value > 0x7fffffff) break;
+  }
+  return value;
+}
+
+/** 容错定位 EBML 元素：数据可能从中途开始，逐步对齐边界 */
+function findEbmlTolerant(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  targetId: number,
+): { start: number; end: number } | null {
+  let offset = start;
+  while (offset + 2 <= end) {
+    const id = readEbmlId(data, offset);
+    if (!id) break;
+    const size = readEbmlSize(data, offset + id.size);
+    if (!size) break;
+    const contentStart = offset + id.size + size.size;
+    if (contentStart > end) {
+      offset += 1;
+      continue;
+    }
+    if (id.value === targetId) {
+      let contentEnd = contentStart + size.value;
+      if (contentEnd > end || contentEnd < contentStart) contentEnd = end;
+      return { start: contentStart, end: contentEnd };
+    }
+    if (size.value > end - contentStart) {
+      const inner = findEbmlTolerant(data, contentStart, end, targetId);
+      if (inner) return inner;
+      break;
+    }
+    offset = contentStart + size.value;
+  }
+  return null;
+}
+
+/** 解析 Matroska/WebM（EBML）容器分辨率 */
+function parseWebmResolution(data: Uint8Array): { width: number; height: number } | null {
+  const segment = findEbmlTolerant(data, 0, data.length, 0x18538067);
+  if (!segment) return null;
+  const tracks = findEbmlTolerant(data, segment.start, segment.end, 0x1654ae6b);
+  if (!tracks) return null;
+  let result: { width: number; height: number } | null = null;
+  walkEbml(data, tracks.start, tracks.end, (id, s, e) => {
+    if (result || id !== 0xae) return; // TrackEntry
+    let isVideo = false;
+    let w = 0;
+    let h = 0;
+    walkEbml(data, s, e, (id2, s2, e2) => {
+      if (id2 === 0x83) {
+        isVideo = data[s2] === 1; // TrackType: 1 = video
+      } else if (id2 === 0xe0) {
+        walkEbml(data, s2, e2, (id3, s3, e3) => {
+          if (id3 === 0xb0) w = readEbmlUint(data, s3, e3); // PixelWidth
+          else if (id3 === 0xba) h = readEbmlUint(data, s3, e3); // PixelHeight
+        });
+      }
+    });
+    if (isVideo && w > 0 && h > 0 && w <= 16384 && h <= 16384) {
+      result = { width: w, height: h };
+    }
+  });
+  return result;
+}
+
+/** 按 Range 读取一段字节 */
+async function readByteRange(
+  url: string,
+  headers: Record<string, string>,
+  start: number,
+  end: number,
+  timeout: number,
+): Promise<Uint8Array | null> {
+  const res = await request(
+    url,
+    { method: 'GET', headers: { ...headers, Range: `bytes=${start}-${end}` } },
+    timeout,
+  );
+  if (!res || !res.ok || !res.bytes || !res.bytes.length) return null;
+  return res.bytes;
+}
+
+/**
+ * 解析渐进式视频直链的容器分辨率（MP4 家族 / WebM / MKV）。
+ * 服务器不支持 Range 或读取失败时返回 null，由调用方兜底。
+ */
+async function probeContainerResolution(
+  url: string,
+  format: string,
+  headers: Record<string, string>,
+  timeout: number,
+  knownSize?: number,
+): Promise<{ width: number; height: number } | null> {
+  const isMp4Family = ['mp4', 'm4v', 'mov', 'm4s', 'f4v', '3gp', '3gp2'].indexOf(format) >= 0;
+  const isMatroska = format === 'webm' || format === 'mkv';
+  if (!isMp4Family && !isMatroska) return null;
+
+  // 1) 读文件头
+  const headBytes = isMatroska ? WEBM_HEAD_BYTES : CONTAINER_HEAD_BYTES;
+  const head = await readByteRange(url, headers, 0, headBytes - 1, timeout);
+  if (head) {
+    const dim = isMatroska ? parseWebmResolution(head) : parseIsoBmffResolution(head);
+    if (dim) return dim;
+  }
+
+  // 2) MP4 的 moov 常被放到文件末尾（未做 faststart 优化），补读尾部
+  if (isMp4Family && knownSize && knownSize > headBytes) {
+    const tailStart = Math.max(0, knownSize - CONTAINER_TAIL_BYTES);
+    const tail = await readByteRange(url, headers, tailStart, knownSize - 1, timeout);
+    if (tail) {
+      const combined = new Uint8Array((head ? head.length : 0) + tail.length);
+      if (head) combined.set(head, 0);
+      combined.set(tail, head ? head.length : 0);
+      const dim = parseIsoBmffResolution(combined);
+      if (dim) return dim;
+      const dimTail = parseIsoBmffResolution(tail);
+      if (dimTail) return dimTail;
+    }
+  }
+
+  return null;
+}
+
 /**
  * 校验单个视频资源。
  */
@@ -483,12 +877,39 @@ export async function probeVideoItem(
       downloadable: false,
       headers,
     };
+    // 从 MPD XML 中提取视频 Representation 的分辨率
+    let width: number | undefined;
+    let height: number | undefined;
+    if (body && body.length) {
+      const xml = decodeText(body);
+      const reps = xml.match(/<Representation\b[^>]*>/g);
+      if (reps) {
+        for (let i = 0; i < reps.length; i++) {
+          const rep = reps[i];
+          // 只取视频轨：mimeType 标注 video，或完全没有 audio 标记
+          if (/(mimeType="[^"]*video)/i.test(rep) || !/audio/i.test(rep)) {
+            const wm = /width="(\d+)"/.exec(rep);
+            const hm = /height="(\d+)"/.exec(rep);
+            if (wm && hm) {
+              const w = parseInt(wm[1], 10);
+              const h = parseInt(hm[1], 10);
+              if (w > 0 && h > 0 && w <= 16384 && h <= 16384 && (!width || !height || w * h > width * height)) {
+                width = w;
+                height = h;
+              }
+            }
+          }
+        }
+      }
+    }
     if (Platform.OS === 'ios') {
       return { ...dashBase, status: 'unplayable', note: 'DASH（.mpd）流媒体在 iOS 上无法播放' };
     }
     return {
       ...dashBase,
       status: 'playable',
+      width,
+      height,
       note: 'DASH 流媒体：可在预览中播放，暂不支持直接下载保存',
     };
   }
@@ -516,12 +937,25 @@ export async function probeVideoItem(
     };
   }
 
+  // 渐进式视频：DOM/JSON 采集的分辨率常缺失或为 0，解析容器头获取真实分辨率
+  let width = item.width;
+  let height = item.height;
+  if (!width || !height) {
+    const dim = await probeContainerResolution(item.url, guess, headers, timeout, size);
+    if (dim) {
+      width = dim.width;
+      height = dim.height;
+    }
+  }
+
   return {
     status: 'playable',
     streamKind: 'progressive',
     format: guess,
     contentType: contentType || undefined,
     size,
+    width,
+    height,
     downloadable: true,
     headers,
   };

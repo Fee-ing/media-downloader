@@ -20,7 +20,7 @@ import ListHeader from './src/components/ListHeader';
 import LoadingPanel from './src/components/LoadingPanel';
 import DownloadOverlay from './src/components/DownloadOverlay';
 import FilterSortModal from './src/components/FilterSortModal';
-import ScrapeWebView from './src/components/ScrapeWebView';
+import BrowserStyleWebView from './src/components/BrowserStyleWebView';
 import SelectionBar from './src/components/SelectionBar';
 import UrlBar from './src/components/UrlBar';
 import VideoCard from './src/components/VideoCard';
@@ -83,11 +83,21 @@ export default function App() {
 
   const busy = LOADING_PHASES.includes(progress.phase);
   const hasResult = progress.phase === 'done';
-  const expanded = busy || hasResult || progress.phase === 'error';
+  // 标记是否已触发抓取
+  const [isActive, setIsActive] = useState(false);
+  // 输入框是否已固定到顶部：点击「开始」后不再回到中间，输入过程中保持原位
+  const [stickyTop, setStickyTop] = useState(false);
+  useEffect(() => {
+    if (isActive || hasResult) setStickyTop(true);
+  }, [isActive, hasResult]);
+  const expanded = stickyTop;
+  // 抓取成功后浏览器窗口收起（高度 → 0）
+  const browserCollapsed = hasResult;
 
   const slideAnim = useRef(new Animated.Value(1)).current;
   const brandAnim = useRef(new Animated.Value(1)).current;
   const contentAnim = useRef(new Animated.Value(0)).current;
+  const browserH = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     Animated.parallel([
@@ -111,12 +121,26 @@ export default function App() {
     ]).start();
   }, [expanded, slideAnim, brandAnim, contentAnim]);
 
+  useEffect(() => {
+    Animated.timing(browserH, {
+      toValue: browserCollapsed ? 0 : 1,
+      duration: 340,
+      easing: Easing.inOut(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [browserCollapsed, browserH]);
+
   const idleOffset = Math.max(0, screenHeight * 0.5 - 200);
   const translateY = slideAnim.interpolate({
     inputRange: [0, 1],
     outputRange: [0, idleOffset],
   });
   const brandHeight = brandAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 108] });
+  // 浏览器窗口宽度占满屏幕，按 4:3 宽高比计算高度（高 = 宽 × 3/4），同时限制不超过屏幕高度 60%
+  const browserMaxHeight = browserH.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, Math.min(Math.round(screenWidth * (3 / 4)), Math.round(screenHeight * 0.6))],
+  });
 
   // 默认隐藏判定为「无法播放」的资源，用户可在列表顶部切换查看
   const hiddenUnplayable = useMemo(
@@ -232,6 +256,7 @@ export default function App() {
     setProbeStatus(null);
     setShowUnplayable(false);
     setProgress({ phase: 'opening', message: '正在打开网页…' });
+    setIsActive(true);
     setRunId(id => id + 1);
     setTaskUrl(normalized);
   };
@@ -239,6 +264,7 @@ export default function App() {
   const handleStop = () => {
     probeStopRef.current = true;
     abortRef.current?.abort();
+    setIsActive(false);
     setTaskUrl(null);
     setProgress({ phase: 'idle', message: '' });
   };
@@ -372,8 +398,18 @@ export default function App() {
   );
 
   const renderContent = () => {
-    if (busy) {
-      return <LoadingPanel progress={progress} onCancel={handleStop} />;
+    // 未开始抓取时不展示内容区（输入框初始居中）
+    if (progress.phase === 'idle') return null;
+
+    // 抓取中且尚无数据时：展示简洁 loading
+    const isLoading =
+      !hasResult &&
+      progress.phase !== 'error' &&
+      images.length === 0 &&
+      videos.length === 0;
+
+    if (isLoading) {
+      return <LoadingPanel progress={progress} />;
     }
 
     if (progress.phase === 'error') {
@@ -387,8 +423,6 @@ export default function App() {
         />
       );
     }
-
-    if (!hasResult) return null;
 
     return (
       <View style={styles.resultWrap}>
@@ -503,19 +537,9 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safe}>
-      {/* 放在最前面，保证它（含其不透明遮罩）绘制在所有界面元素之下 */}
-      {taskUrl && busy ? (
-        <ScrapeWebView
-          key={`${taskUrl}-${runId}`}
-          url={taskUrl}
-          onProgress={setProgress}
-          onResult={handleResult}
-          onError={handleError}
-        />
-      ) : null}
-
       <StatusBar style="light" />
 
+      {/* 顶部：初始居中，开始输入/抓取后固定在顶部 */}
       <Animated.View style={[styles.top, { transform: [{ translateY }] }]}>
         <Animated.View style={[styles.brand, { height: brandHeight, opacity: brandAnim }]}>
           <Text style={styles.brandTitle}>网页媒体抓取</Text>
@@ -538,6 +562,20 @@ export default function App() {
           </Text>
         ) : null}
       </Animated.View>
+
+      {/* 浏览器窗口：位于输入框下方，抓取成功后收起（高度 → 0） */}
+      {taskUrl ? (
+        <Animated.View style={[styles.browserWrap, { height: browserMaxHeight }]}>
+          <BrowserStyleWebView
+            key={`${taskUrl}-${runId}`}
+            url={taskUrl}
+            onProgress={setProgress}
+            onResult={handleResult}
+            onError={handleError}
+            onStop={handleStop}
+          />
+        </Animated.View>
+      ) : null}
 
       <Animated.View style={[styles.content, { opacity: contentAnim }]}>
         {renderContent()}
@@ -605,6 +643,9 @@ const styles = StyleSheet.create({
   safe: {
     flex: 1,
     backgroundColor: COLORS.bg,
+  },
+  browserWrap: {
+    overflow: 'hidden',
   },
   top: {
     paddingHorizontal: PAGE_PADDING,

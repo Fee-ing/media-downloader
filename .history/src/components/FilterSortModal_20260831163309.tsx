@@ -14,8 +14,8 @@ import { COLORS } from '../constants';
 import type { FilterState, MediaKind, SortField, SortOrder } from '../types';
 
 const SORT_FIELDS: Array<{ key: SortField; label: string }> = [
-  { key: 'dimension', label: '尺寸' },
   { key: 'size', label: '大小' },
+  { key: 'dimension', label: '尺寸' },
   { key: 'duration', label: '时长' },
   { key: 'title', label: '标题' },
 ];

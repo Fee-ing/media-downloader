@@ -43,7 +43,10 @@ export default function ListHeader({
   showUnplayable = false,
   onToggleUnplayable,
 }: Props) {
-  const filtered = filter.keyword.trim().length > 0 || filter.sortField !== 'default';
+  const filtered =
+    filter.keyword.trim().length > 0 ||
+    filter.sortField !== 'dimension' ||
+    filter.sortOrder !== 'desc';
 
   return (
     <View style={styles.wrapper}>
@@ -112,7 +115,7 @@ export default function ListHeader({
               {filter.keyword.trim()
                 ? `“${filter.keyword.trim()}”`
                 : SORT_LABEL[filter.sortField]}
-              {filter.sortField !== 'default'
+              {filter.sortField !== 'dimension'
                 ? ` · ${filter.sortOrder === 'asc' ? '升序' : '降序'}`
                 : ''}
             </Text>

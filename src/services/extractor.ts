@@ -21,6 +21,32 @@ const BASE_SETUP_SCRIPT = `(function () {
   var LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url', 'data-echo', 'data-image', 'data-href', 'data-fallback-src'];
   var SKIP = /(sprite|placeholder|loading\\.gif|blank\\.(png|gif)|1x1|pixel\\.(png|gif)|spacer|icon-)/i;
 
+  /**
+   * 从 URL 推断分辨率（仅匹配明确的 宽x高 / w=&h= / 1080p 模式），
+   * 签名 CDN 链接常把清晰度写进地址，可作为容器探测前的兜底。
+   */
+  function resFromUrl(u) {
+    var m, w, h;
+    m = /(?:^|[^0-9])([0-9]{3,4})[xX\\u00d7]([0-9]{3,4})(?:[^0-9]|$)/.exec(u);
+    if (m) {
+      w = parseInt(m[1], 10);
+      h = parseInt(m[2], 10);
+      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
+    }
+    m = /[?&](?:w|width)=([0-9]{3,4})[^&#]*[?&](?:h|height)=([0-9]{3,4})/i.exec(u);
+    if (m) {
+      w = parseInt(m[1], 10);
+      h = parseInt(m[2], 10);
+      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
+    }
+    m = /(?:^|[^0-9])([0-9]{3,4})p(?:[^0-9]|$)/i.exec(u);
+    if (m) {
+      h = parseInt(m[1], 10);
+      if (h >= 300 && h <= 7680) { return { w: Math.round((h * 16) / 9), h: h }; }
+    }
+    return null;
+  }
+
   function abs(u) {
     if (!u) { return ''; }
     u = String(u).trim();
@@ -378,6 +404,14 @@ const BASE_SETUP_SCRIPT = `(function () {
         seen['v' + o.url] = true;
         o.w = o.w > 0 ? Math.round(o.w) : 0;
         o.h = o.h > 0 ? Math.round(o.h) : 0;
+        // URL 中明确带清晰度（如 1080x1920 / 1080p）时作为兜底
+        if ((!o.w || !o.h) && !o.viaNetwork) {
+          var rd = resFromUrl(o.url);
+          if (rd) {
+            if (!o.w) { o.w = rd.w; }
+            if (!o.h) { o.h = rd.h; }
+          }
+        }
         if (!o.size) { o.size = timing[o.url]; }
         out.videos.push(o);
       },
@@ -672,6 +706,33 @@ const BASE_SETUP_SCRIPT = `(function () {
     var VIDEO_KEY_HINT = /(masterUrl|backupUrl|baseUrl|playUrl|play_url|playAddr|play_addr|url_list|videoUrl|video_url|srcUrl|downloadUrl|streamUrl|mediaUrl|originVideoKey|playlink)/i;
     var IMG_EXT_RE = /\\.(jpe?g|png|gif|webp|bmp|avif|svg|ico)([?#]|$)/i;
     var MEDIA_HOST_RE = /(\\/video\\/|\\/play\\/|\\/stream\\/|\\/upos|bilivideo|douyinvod|aweme|amemv|snssdk|xhscdn|snap)/i;
+    var toDim = function (v) {
+      if (typeof v === 'number' && isFinite(v)) { return Math.round(v); }
+      if (typeof v === 'string') {
+        var n = parseFloat(v);
+        return isFinite(n) ? Math.round(n) : 0;
+      }
+      return 0;
+    };
+    /**
+     * 从 JSON 对象里提取宽高（常见字段：width/height、w/h、videoWidth/…），
+     * 站点接口的播放地址旁往往带这几个字段，比事后探测更可靠。
+     */
+    var dimOf = function (o) {
+      if (!o || typeof o !== 'object' || Array.isArray(o)) { return null; }
+      var W_KEYS = ['width', 'w', 'videoWidth', 'video_width', 'awemeWidth', 'img_width', 'res_w'];
+      var H_KEYS = ['height', 'h', 'videoHeight', 'video_height', 'awemeHeight', 'img_height', 'res_h'];
+      var w = 0, h = 0, i, v;
+      for (i = 0; i < W_KEYS.length; i++) {
+        v = toDim(o[W_KEYS[i]]);
+        if (v > 0 && v < 20000) { w = v; break; }
+      }
+      for (i = 0; i < H_KEYS.length; i++) {
+        v = toDim(o[H_KEYS[i]]);
+        if (v > 0 && v < 20000) { h = v; break; }
+      }
+      return w && h ? { w: w, h: h } : null;
+    };
     var isVideoish = function (u, key) {
       if (!u || u.indexOf('http') !== 0) { return false; }
       if (SKIP.test(u)) { return false; }
@@ -683,15 +744,17 @@ const BASE_SETUP_SCRIPT = `(function () {
     var scanBudget = 6000;
     var scanJson = function (obj) {
       if (!obj || typeof obj !== 'object') { return; }
-      var stack = [obj];
+      var stack = [{ o: obj, p: null }];
       var visited = 0;
       var key, val, ai;
       while (stack.length && visited < scanBudget) {
-        var cur = stack.pop();
+        var item = stack.pop();
         visited++;
+        var cur = item.o;
+        var parent = item.p;
         if (!cur || typeof cur !== 'object') { continue; }
         if (Array.isArray(cur)) {
-          for (ai = 0; ai < cur.length; ai++) { stack.push(cur[ai]); }
+          for (ai = 0; ai < cur.length; ai++) { stack.push({ o: cur[ai], p: parent }); }
           continue;
         }
         for (key in cur) {
@@ -699,10 +762,19 @@ const BASE_SETUP_SCRIPT = `(function () {
           val = cur[key];
           if (typeof val === 'string' && val.length > 10) {
             if (isVideoish(val, key)) {
-              addVideo({ url: val, w: 0, h: 0, size: 0, title: '', source: 'json' });
+              // 播放地址旁的 width/height（或其父对象）是比事后探测更准的来源
+              var dim = dimOf(cur) || dimOf(parent);
+              addVideo({
+                url: val,
+                w: dim ? dim.w : 0,
+                h: dim ? dim.h : 0,
+                size: 0,
+                title: '',
+                source: 'json'
+              });
             }
           } else if (val && typeof val === 'object') {
-            stack.push(val);
+            stack.push({ o: val, p: cur });
           }
         }
       }

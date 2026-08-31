@@ -46,7 +46,7 @@ export interface MediaItem {
   pageProbeOk?: boolean;
 }
 
-export type SortField = 'size' | 'dimension' | 'duration' | 'title';
+export type SortField = 'size' | 'dimension' | 'title';
 export type SortOrder = 'asc' | 'desc';
 
 export interface FilterState {
