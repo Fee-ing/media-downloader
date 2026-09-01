@@ -326,7 +326,7 @@ export default function App() {
     let success = 0;
     let failed = 0;
     let index = 0;
-    const saved = { gallery: 0, shared: 0, file: 0 };
+    const saved = { gallery: 0, shared: 0, file: 0, cancelled: 0 };
 
     const base: DownloadSnapshot = {
       total: queue.length,
@@ -361,7 +361,8 @@ export default function App() {
             ),
         });
         saved[result.saved] += 1;
-        success += 1;
+        if (result.saved !== 'cancelled') success += 1;
+        else failed += 1;
       } catch {
         failed += 1;
       }
@@ -402,7 +403,13 @@ export default function App() {
           ),
       });
       setSingleDownload({ id: item.id, state: 'done', progress: 1 });
-      if (result.saved !== 'gallery') {
+      if (result.saved === 'cancelled') {
+        // 用户取消分享，不计入成功，也不弹「已保存」提示
+        setSingleDownload(null);
+        return;
+      }
+      if (result.saved === 'file') {
+        // 仅当真正落到应用目录时才提示（相册/分享/取消均不弹，避免误导）
         Alert.alert('已下载', `${saveResultText(result.saved)}\n${result.uri}`);
       }
     } catch {

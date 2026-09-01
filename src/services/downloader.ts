@@ -8,7 +8,7 @@ import type { MediaItem } from '../types';
 import { buildFileName } from '../utils/url';
 import { muxFragmentedMp4Files } from './mp4Muxer';
 
-export type SaveResult = 'gallery' | 'shared' | 'file';
+export type SaveResult = 'gallery' | 'shared' | 'file' | 'cancelled';
 
 export interface DownloadOptions {
   onProgress?: (progress: number) => void;
@@ -205,29 +205,36 @@ export async function downloadMedia(
 /**
  * 保存到系统相册（照片/视频），失败时降级为系统分享（用户可自行存储）。
  *
- * 注意：Expo Go 运行时不包含 `expo-media-library` 的原生模块（`ExpoMediaLibraryNext`），
- * 而该包在顶层就 `requireNativeModule` 加载原生模块，一旦 `import/require` 该 JS 包就会
- * 直接抛错崩溃。因此我们**不能**引入 `expo-media-library` 包，只能用
- * `requireOptionalNativeModule('ExpoMediaLibraryNext')` 直接探测原生对象：
- *   - 原生模块存在（dev client / 自定义构建）：调 `requestPermissionsAsync` + `Asset.create` 存入相册；
- *   - 原生模块缺失（Expo Go）：探测为 null，干净降级到 `expo-sharing` 系统分享。
+ * 行为区分：
+ *   - 自定义构建（dev build / EAS Build）：`ExpoMediaLibraryNext` 原生模块存在，
+ *     用官方 `expo-media-library` 的 `Asset.create(uri)` 直接写入相册；
+ *   - Expo Go 扫码：`ExpoMediaLibraryNext` 原生模块缺失（requireOptional 返回 null，
+ *     不会抛错），直接降级到 `expo-sharing` 系统分享。
+ *
+ * 关键点：先用 `requireOptionalNativeModule` 探测，仅当原生模块存在时才
+ * `import('expo-media-library')` 拿 `Asset` 类——避免 Expo Go 下 import 官方包
+ * 因顶层加载原生模块而直接崩溃报错。
+ *
+ * 注意：expo-media-library 57 已移除旧 `saveToLibraryAsync`，改由 `Asset.create` 写入。
  */
 export async function saveToGallery(uri: string): Promise<SaveResult> {
-  const MediaLibrary = requireOptionalNativeModule('ExpoMediaLibraryNext');
+  const nativeModule = requireOptionalNativeModule('ExpoMediaLibraryNext');
 
-  if (MediaLibrary != null) {
+  if (nativeModule != null) {
     try {
-      const permission = await MediaLibrary.requestPermissionsAsync(true);
-      if (permission?.granted && MediaLibrary.Asset?.create) {
+      const MediaLibrary = await import('expo-media-library');
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      if (status !== 'granted') {
+        console.warn('[downloader] 用户未授予相册权限，降级为系统分享');
+      } else {
         await MediaLibrary.Asset.create(uri);
         return 'gallery';
-      }
-      if (!permission?.granted) {
-        console.warn('[downloader] 用户未授予相册权限，降级为系统分享');
       }
     } catch (error) {
       console.warn('[downloader] 保存到相册失败，尝试降级：', error);
     }
+  } else {
+    console.warn('[downloader] 未检测到相册原生模块（Expo Go？），降级为系统分享');
   }
 
   try {
@@ -236,7 +243,9 @@ export async function saveToGallery(uri: string): Promise<SaveResult> {
       return 'shared';
     }
   } catch (error) {
-    console.warn('[downloader] 系统分享不可用：', error);
+    // 用户在分享面板点击「取消」会 reject，视为用户主动放弃，不视为错误
+    console.warn('[downloader] 系统分享未完成（可能已取消）：', error);
+    return 'cancelled';
   }
 
   return 'file';
@@ -245,5 +254,6 @@ export async function saveToGallery(uri: string): Promise<SaveResult> {
 export function saveResultText(result: SaveResult): string {
   if (result === 'gallery') return '已保存到相册';
   if (result === 'shared') return '已通过系统分享保存';
+  if (result === 'cancelled') return '已取消保存';
   return '已保存到应用目录';
 }

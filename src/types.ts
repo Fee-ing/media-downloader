@@ -181,6 +181,6 @@ export interface DownloadSnapshot {
   success: number;
   failed: number;
   /** 成功文件的落地方式统计 */
-  saved?: { gallery: number; shared: number; file: number };
+  saved?: { gallery: number; shared: number; file: number; cancelled: number };
   stage: 'downloading' | 'saving' | 'finished' | 'cancelled';
 }

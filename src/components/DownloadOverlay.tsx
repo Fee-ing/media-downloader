@@ -21,6 +21,7 @@ export default function DownloadOverlay({ snapshot, onCancel, onClose }: Props) 
         saved.gallery > 0 ? `已存入相册 ${saved.gallery} 个` : '',
         saved.shared > 0 ? `通过系统分享保存 ${saved.shared} 个` : '',
         saved.file > 0 ? `仅存于应用目录 ${saved.file} 个（相册模块不可用）` : '',
+        saved.cancelled > 0 ? `已取消保存 ${saved.cancelled} 个` : '',
       ]
         .filter(Boolean)
         .join('\n')
