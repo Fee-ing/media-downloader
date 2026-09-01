@@ -799,14 +799,37 @@ const COLLECT_SNIPPET = `(function () {
   };
 
   /**
+   * 站点适配层显式声明的伴音轨地址。
+   *
+   * DASH 的伴音轨多为 .m4s，URL 里既没有 audio 字样、Content-Type 也常是
+   * video/mp4 或 octet-stream，RN 侧靠 URL / 响应头判不出它是音轨，于是：
+   * 音轨可能被选成代表条目（只有声音），或被塞进播放兜底链。
+   * 站点适配层能直接从数据结构里区分（B 站 playinfo 就是 video[] / audio[] 分开的），
+   * 这里把音轨地址登记下来随结果回传，RN 侧据此把同轨的 CDN 镜像也标成伴音轨。
+   * 与具体站点无关，任何适配层都可以调用 MD.declareAudio。
+   */
+  MD.declaredAudioUrls = [];
+  MD.declareAudio = function (u) {
+    try {
+      var full = abs(u);
+      if (!full) { return; }
+      for (var i = 0; i < MD.declaredAudioUrls.length; i++) {
+        if (MD.declaredAudioUrls[i] === full) { return; }
+      }
+      MD.declaredAudioUrls.push(full);
+    } catch (e) {}
+  };
+
+  /**
    * B 站专属适配：解析 DASH 音画分离结构。
    *
    * B 站视频是 DASH 格式，video[] 与 audio[] 各自独立：
    *   data.dash.video[].baseUrl  —— 视频轨（.m4s，无声）
    *   data.dash.audio[].baseUrl  —— 伴音轨（.m4a/.m4s）
    * 两者在页面里是分离的地址，通用规则只能捞到视频轨，导致「播放无声 +
-   * 下载只得到无声 m4s」。这里直接读取 playinfo，把每条视频轨与「带宽最高的
-   * 伴音轨」配对，通过 audioTrackUrl 一并带回，下游的合并 / 双轨播放才能生效。
+   * 下载只得到无声 m4s」。这里直接读取 playinfo，把每条视频轨与全部伴音轨配对
+   * （按带宽从高到低，逐条兜底），通过 audioTrackUrls 一并带回，下游的合并 /
+   * 双轨播放才能生效。
    *
    * 只认 bilibili 域名，避免误伤其它站点。返回是否成功拿到数据（供等待循环判断）。
    */
@@ -819,19 +842,26 @@ const COLLECT_SNIPPET = `(function () {
       var audios = dash.audio || [];
       if (!videos.length) { return false; }
 
-      // 选一条音轨：带宽最高（最清晰）的伴音轨；无带宽则取第一条
-      var bestAudio = null;
+      // 全部伴音轨：按带宽从高到低排序，逐个作为下载 / 播放的兜底。
+      // 只留一条时，恰好该节点失效就会「有画面没声音」。
+      var audioList = [];
       for (var a = 0; a < audios.length; a++) {
         var au = audios[a];
+        if (!au) { continue; }
         // baseUrl 在 B 站常被置空，真正的可下载地址在 backupUrl[0]
-        var auUrl = au && (au.baseUrl || (au.backupUrl && au.backupUrl[0]) || au.base_url || au.url);
+        var auUrl = au.baseUrl || (au.backupUrl && au.backupUrl[0]) || au.base_url || au.url;
         if (!auUrl) { continue; }
         var bw = parseInt(au.bandwidth || au.BandWidth || 0, 10) || 0;
-        if (!bestAudio || bw > (bestAudio._bw || 0)) {
-          bestAudio = { url: auUrl, _bw: bw };
+        audioList.push({ url: auUrl, bw: bw });
+        // 备用地址也登记为音轨：网络层抓到的常是 backupUrl 里的镜像
+        if (au.backupUrl && au.backupUrl.length) {
+          for (var b = 0; b < au.backupUrl.length; b++) { MD.declareAudio(au.backupUrl[b]); }
         }
+        MD.declareAudio(auUrl);
       }
-      var audioUrl = bestAudio ? bestAudio.url : '';
+      audioList.sort(function (x, y) { return y.bw - x.bw; });
+      var audioUrls = [];
+      for (var ai = 0; ai < audioList.length; ai++) { audioUrls.push(audioList[ai].url); }
 
       for (var v = 0; v < videos.length; v++) {
         var vv = videos[v];
@@ -844,7 +874,8 @@ const COLLECT_SNIPPET = `(function () {
           duration: dash.duration ? parseFloat(dash.duration) : undefined,
           title: document.title || '',
           source: 'json',
-          audioTrackUrl: audioUrl || undefined
+          audioTrackUrl: audioUrls[0] || undefined,
+          audioTrackUrls: audioUrls.length ? audioUrls.slice() : undefined
         });
       }
       return true;
@@ -889,6 +920,8 @@ const COLLECT_SNIPPET = `(function () {
       streamVideos: NET.streams || 0,
       /** 网络层捕获到的媒体请求数 */
       networkCount: NET.entries ? NET.entries.length : 0,
+      /** 站点适配层显式声明的伴音轨地址（DASH 音画分离），供 RN 侧标注音轨 */
+      audioUrls: [],
       images: [],
       videos: [],
       /** 调试用：B 站音画分离探测结果（仅 bilibili 域名有意义） */
@@ -917,6 +950,7 @@ const COLLECT_SNIPPET = `(function () {
       out.biliDebug = { error: String((e && e.message) || e) };
     }
     MD.collectBilibiliDash(addVideo);
+    out.audioUrls = MD.declaredAudioUrls || [];
 
     // ---------- 图片 ----------
     var imgs = MD.queryAll('img');

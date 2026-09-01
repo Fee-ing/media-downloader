@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "媒体抓取器",
+    "name": "Media Downloader",
     "slug": "media-downloader",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -51,6 +51,12 @@
           "isAccessMediaLocationEnabled": true
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4da56464-4d1f-4fe9-b593-3dccd8d02947"
+      }
+    },
+    "owner": "ubiyachi"
   }
 }

@@ -44,6 +44,12 @@ export interface MediaItem {
   audioTrackUrls?: string[];
   /** 同组其余轨道地址（低码率视频轨等），播放失败时按序兜底 */
   variantUrls?: string[];
+  /**
+   * 页面脚本的站点适配层显式声明的伴音轨（如 B 站 playinfo 的 dash.audio）。
+   * 仅用于音视频轨判定，不对外展示；DASH 音轨多为 .m4s，靠 URL / Content-Type
+   * 判不出来，只能靠站点自身的数据结构确认。
+   */
+  declaredAudio?: boolean;
   /** 是否可以直接下载保存（HLS/DASH 需合并分片，暂不支持） */
   downloadable?: boolean;
   /** 下载/播放时需要携带的请求头（Referer、Cookie 等） */
@@ -104,6 +110,12 @@ export interface RawScrapePayload {
   streamVideos?: number;
   /** 网络层捕获到的媒体请求数 */
   networkCount?: number;
+  /**
+   * 站点适配层显式声明的伴音轨地址（如 B 站 playinfo 的 dash.audio[].baseUrl）。
+   * 与具体站点无关：任何适配层只要能区分音视频轨，就把音轨地址放这里，RN 侧会
+   * 据此标记同轨的 CDN 镜像为伴音轨，避免音轨被当成视频轨选成代表条目。
+   */
+  audioUrls?: string[];
   /** B 站音画分离探测诊断（仅 bilibili 域名有意义） */
   biliDebug?: {
     isBili: boolean;
@@ -155,6 +167,8 @@ export interface RawScrapePayload {
      * 靠 URL/Content-Type 模糊识别的 looksAudio，避免音频轨被误判为视频轨。
      */
     audioTrackUrl?: string;
+    /** 全部伴随音轨地址（多码率音轨按优劣排序），首条与 audioTrackUrl 一致 */
+    audioTrackUrls?: string[];
   }>;
 }
 

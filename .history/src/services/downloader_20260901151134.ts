@@ -184,14 +184,7 @@ export async function downloadMedia(
 
   // DASH 音画分离（配对了独立伴音轨的视频轨）：合并成单个 MP4 再下载
   const separated = isSeparatedDash(item);
-  console.log('[DL]', {
-    separated,
-    hasAudio: audioUris.length > 0,
-    audioCount: audioUris.length,
-    audio: audioUris.map(u => u.slice(0, 80)),
-    url: item.url.slice(0, 80),
-    headers,
-  });
+  console.log('[DL]', { separated, hasAudio: audioUris.length > 0, audioCount: audioUris.length, url: item.url, headers });
 
   const target = separated
     ? await downloadMuxed(item, audioUris, file, headers, options)

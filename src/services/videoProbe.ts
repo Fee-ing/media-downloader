@@ -53,6 +53,8 @@ export interface VideoProbeResult {
   status: VideoPlaybackStatus;
   /** 给用户看的原因 / 提示 */
   note?: string;
+  /** 探测因网络受限被跳过、状态由「上游站点适配层已确认有效」推断而来 */
+  probeSkipped?: boolean;
   streamKind?: VideoStreamKind;
   format?: string;
   contentType?: string;
@@ -692,6 +694,25 @@ async function probeContainerResolution(
 }
 
 /**
+ * 上游站点适配层是否已明确确认该资源有效。
+ *
+ * 满足任一即视为「来源可靠，应信任」：
+ * - 配对了独立伴音轨（DASH 音画分离）：站点适配层从 playinfo 等结构里明确区分了
+ *   音视频轨，说明这确实是一条视频，且播放/下载时已有音轨可合并；
+ * - 直接来自页面 playinfo / JSON（source==='json'）：站点专属适配层已从页面数据结构
+ *   里读到的真实地址，不是模糊嗅探猜出来的。
+ *
+ * 这类资源即使 App 侧的 HEAD/GET 探测因自定义端口、签名直链、证书或超时失败，
+ * 真实播放器（带 Referer）通常也能正常访问，因此不应直接判为「无法播放」而隐藏。
+ */
+function isConfirmedValidSource(item: MediaItem): boolean {
+  const hasAudioPair =
+    (Array.isArray(item.audioTrackUrls) && item.audioTrackUrls.length > 0) ||
+    !!item.audioTrackUrl;
+  return hasAudioPair || item.source === 'json';
+}
+
+/**
  * 校验单个视频资源。
  */
 export async function probeVideoItem(
@@ -717,6 +738,12 @@ export async function probeVideoItem(
   if (!head || !head.ok) {
     // HEAD 常被 CDN / WAF 直接拒绝（405/403），不能只凭它下结论，降级为 Range GET 再判定
     if (head && (head.status === 404 || head.status === 410)) {
+      // 站点适配层已确认有效的资源（B 站 playinfo 的 DASH 直链等），HEAD 返回 404/410
+      // 通常是 CDN 对 HEAD 方法的限制或签名节点差异，真实播放器带 Referer 用 GET 能访问，
+      // 不应据此判「资源已失效」而隐藏整条。
+      if (isConfirmedValidSource(item)) {
+        return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
+      }
       return {
         status: 'unplayable',
         downloadable: false,
@@ -730,6 +757,13 @@ export async function probeVideoItem(
       timeout,
     );
     if (!fallback) {
+      // 探测请求本身失败（App 网络层对自定义端口 / 签名直链常因证书或超时失败），
+      // 但若上游站点适配层已明确确认这是有效资源（配对了独立音轨的 DASH 视频轨，
+      // 或直接来自页面 playinfo），则信任上游、降级为可播放——真实播放器带 Referer
+      // 能正常访问，不应因探测受限就把整条资源隐藏掉。
+      if (isConfirmedValidSource(item)) {
+        return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
+      }
       return {
         status: 'unplayable',
         downloadable: false,
@@ -742,6 +776,9 @@ export async function probeVideoItem(
       };
     }
     if (!fallback.ok) {
+      if (isConfirmedValidSource(item)) {
+        return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
+      }
       return {
         status: 'unplayable',
         downloadable: false,
@@ -754,6 +791,9 @@ export async function probeVideoItem(
   }
 
   if (!result) {
+    if (isConfirmedValidSource(item)) {
+      return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
+    }
     return {
       status: 'unplayable',
       downloadable: false,

@@ -29,6 +29,8 @@ import {
   isManifestUrl,
   isStrongSegmentUrl,
   mediaResourceFingerprint,
+  mediaTrackFingerprint,
+  mergeAudioTrackUrls,
   m4sTrackKeyOf,
   normalizeForDedupe,
   segmentKeyOf,
@@ -92,6 +94,8 @@ interface Candidate {
   audioTrackUrls?: string[];
   /** 同组其余轨道地址（备用码率等），播放失败时按序兜底 */
   variantUrls?: string[];
+  /** 站点适配层显式声明的伴音轨（DASH 音轨多为 .m4s，URL 特征判不出来） */
+  declaredAudio?: boolean;
   score: number;
 }
 
@@ -128,6 +132,12 @@ function scoreCandidate(c: Candidate): number {
 function mergeCandidate(a: Candidate, b: Candidate): Candidate {
   const win = b.score > a.score ? b : a;
   const lose = b.score > a.score ? a : b;
+  // 伴音轨：两条各自配到的音轨都留着（去重、胜者的排在前面），
+  // 避免「同一资源的不同镜像」合并时把音轨配对丢掉
+  const audioUrls = mergeAudioTrackUrls(
+    mergeAudioTrackUrls(win.audioTrackUrls, win.audioTrackUrl ? [win.audioTrackUrl] : []),
+    mergeAudioTrackUrls(lose.audioTrackUrls, lose.audioTrackUrl ? [lose.audioTrackUrl] : []),
+  );
   return {
     url: win.url,
     score: win.score,
@@ -146,8 +156,10 @@ function mergeCandidate(a: Candidate, b: Candidate): Candidate {
     probeOk: win.probeOk ?? lose.probeOk,
     streamKind: win.streamKind || lose.streamKind,
     trackCount: win.trackCount || lose.trackCount,
-    audioTrackUrl: win.audioTrackUrl || lose.audioTrackUrl,
-    audioTrackUrls: win.audioTrackUrls || lose.audioTrackUrls,
+    // declaredAudio 是 URL 自身的属性，取胜者即可，不做 OR 合并
+    declaredAudio: win.declaredAudio,
+    audioTrackUrls: audioUrls.length ? audioUrls : undefined,
+    audioTrackUrl: audioUrls.length ? audioUrls[0] : undefined,
     variantUrls: win.variantUrls || lose.variantUrls,
   };
 }
@@ -289,8 +301,11 @@ function foldM4sTracks(candidates: Candidate[]): Candidate[] {
       folded.push(...group);
       return;
     }
-    // 音频轨特征：audio 发起者 / Content-Type audio/* / URL 或路径带 audio / .m4a/.aac
+    // 音频轨判定：站点适配层显式声明 > audio 发起者 > Content-Type audio/*
+    // > URL 或路径带 audio / .m4a/.aac。DASH 音轨多为 .m4s，后三条几乎都不成立，
+    // declaredAudio 是唯一可靠的信号。
     const looksAudio = (c: Candidate) =>
+      !!c.declaredAudio ||
       c.initiator === 'audio' ||
       (c.contentType || '').toLowerCase().indexOf('audio/') === 0 ||
       /(?:^|[/._-])audio(?:[/._-]|$)/i.test(c.url) ||
@@ -300,11 +315,17 @@ function foldM4sTracks(candidates: Candidate[]): Candidate[] {
       folded.push(...group);
       return;
     }
-    // 代表必须选视频轨：音轨单独播放没有画面。音频候选大幅降权，防止被选为代表
-    const scoreOf = (c: Candidate) => c.score - (looksAudio(c) ? 1000 : 0);
+    // 代表必须选视频轨：音轨单独播放没有画面。音频候选大幅降权，防止被选为代表。
+    // 选代表以「分辨率（面积）最高」为第一优先级（不同清晰度同属一组，应留最高清），
+    // 分辨率相同时再让 score 高者领先；音轨分数扣 1000 保底，绝不会抢代表。
+    const keeperScore = (c: Candidate) => {
+      const area = (c.width || 0) * (c.height || 0);
+      const audioPenalty = looksAudio(c) ? -1e9 : 0;
+      return area * 1e6 + (c.score || 0) + audioPenalty;
+    };
     let best = group[0];
     for (let i = 1; i < group.length; i++) {
-      if (scoreOf(group[i]) > scoreOf(best)) best = group[i];
+      if (keeperScore(group[i]) > keeperScore(best)) best = group[i];
     }
     // 以 best 为底座，用其余轨道补齐空缺字段（best 的 url/score 保持不变）
     const keeper: Candidate = { ...best };
@@ -324,24 +345,31 @@ function foldM4sTracks(candidates: Candidate[]): Candidate[] {
       keeper.initiator = keeper.initiator || c.initiator;
       keeper.probeOk = keeper.probeOk || c.probeOk;
       keeper.streamKind = keeper.streamKind || c.streamKind;
+      // 注意：declaredAudio 描述的是「这个 URL 自己是音轨还是视频轨」，
+      // **绝不能**从同组其它轨道继承 —— 同组里既有视频轨也有伴音轨，一继承就会把
+      // 视频轨代表标成音轨，正片随后被当成「只有声音」的条目处理掉。
+      // 同组其它轨道已配好的伴音轨则相反，代表没有时必须继承，否则音画配对丢失。
+      if (!keeper.audioTrackUrl) keeper.audioTrackUrl = c.audioTrackUrl;
+      if (!keeper.audioTrackUrls || !keeper.audioTrackUrls.length) {
+        keeper.audioTrackUrls = c.audioTrackUrls;
+      }
     });
     keeper.trackCount = group.length;
     // 备用轨道只收视频轨：音轨单独播放没有画面，不能进播放兜底链
     keeper.variantUrls = group
       .filter(c => c !== best && !looksAudio(c))
       .map(c => c.url);
-    // 伴音轨：优先采用组内被识别为音频的候选；同时保留 best 自带（即上游
-    // 站点专属适配已显式配对、但未与本视频轨分到同一组）的 audioTrackUrl，
-    // 避免 DASH 音画分离场景下配对信息被折叠逻辑清掉，导致无声 / 只下视频轨。
+    // 伴音轨：组内识别出的音轨 + 各轨道自带的配对（站点适配显式给出、或指纹广播
+    // 得到的）合并去重，自带配对排在前。识别不出音轨时绝不能把已有配对清成空数组。
     const audioTracks = group.filter(looksAudio);
-    const audioSet = new Set<string>(audioTracks.map(a => a.url));
-    if (best.audioTrackUrl && !audioSet.has(best.audioTrackUrl)) {
-      audioTracks.unshift({ ...best, url: best.audioTrackUrl });
-      audioSet.add(best.audioTrackUrl);
-    }
-    keeper.audioTrackUrls = audioTracks.map(a => a.url);
-    const audio = audioTracks[0];
-    if (audio) keeper.audioTrackUrl = audio.url;
+    keeper.audioTrackUrls = mergeAudioTrackUrls(
+      mergeAudioTrackUrls(
+        keeper.audioTrackUrls,
+        keeper.audioTrackUrl ? [keeper.audioTrackUrl] : [],
+      ),
+      audioTracks.map(a => a.url),
+    );
+    if (keeper.audioTrackUrls.length) keeper.audioTrackUrl = keeper.audioTrackUrls[0];
     folded.push(keeper);
   });
 
@@ -364,6 +392,8 @@ function toCandidate(raw: {
   initiator?: string;
   probeOk?: boolean;
   audioTrackUrl?: string;
+  audioTrackUrls?: string[];
+  declaredAudio?: boolean;
 }): Candidate {
   const candidate: Candidate = {
     url: raw.url,
@@ -379,6 +409,7 @@ function toCandidate(raw: {
     viaNetwork: raw.viaNetwork,
     initiator: raw.initiator,
     probeOk: raw.probeOk,
+    declaredAudio: raw.declaredAudio || undefined,
     audioTrackUrl: raw.audioTrackUrl || undefined,
     audioTrackUrls: Array.isArray(raw.audioTrackUrls) && raw.audioTrackUrls.length > 0
       ? raw.audioTrackUrls
@@ -420,6 +451,7 @@ function toMediaItem(c: Candidate, index: number): MediaItem {
     audioTrackUrl: c.audioTrackUrl,
     audioTrackUrls: c.audioTrackUrls,
     variantUrls: c.variantUrls,
+    declaredAudio: c.declaredAudio,
   };
 }
 
@@ -535,22 +567,38 @@ export async function scrapeMedia(payload: RawScrapePayload): Promise<ScrapeOutc
   // 资源，把同批里已配对的 audioTrackUrl 广播给同源资源、自身未带音轨的其它候选，与
   // 具体站点无关。
   if (Array.isArray(rawVideos)) {
-    // 按资源指纹收集「已配好音轨的代表地址」
-    const audioByFingerprint = new Map<string, string>();
+    // 按资源指纹收集「已配好音轨的代表地址」（保留整组，多音轨才能一并广播）
+    const audioByFingerprint = new Map<string, string[]>();
     for (const r of rawVideos) {
-      if (r?.url && r.audioTrackUrl) {
-        audioByFingerprint.set(mediaResourceFingerprint(r.url), r.audioTrackUrl);
-      }
+      if (!r?.url) continue;
+      const picked = Array.isArray(r.audioTrackUrls) && r.audioTrackUrls.length
+        ? r.audioTrackUrls
+        : r.audioTrackUrl
+          ? [r.audioTrackUrl]
+          : [];
+      if (!picked.length) continue;
+      const key = mediaResourceFingerprint(r.url);
+      const prev = audioByFingerprint.get(key);
+      audioByFingerprint.set(key, mergeAudioTrackUrls(prev, picked));
     }
     if (audioByFingerprint.size > 0) {
       for (const r of rawVideos) {
-        if (r?.url && !r.audioTrackUrl) {
-          const audio = audioByFingerprint.get(mediaResourceFingerprint(r.url));
-          if (audio) r.audioTrackUrl = audio;
+        if (!r?.url || r.audioTrackUrl) continue;
+        const audio = audioByFingerprint.get(mediaResourceFingerprint(r.url));
+        if (audio && audio.length) {
+          r.audioTrackUrl = audio[0];
+          r.audioTrackUrls = audio.slice();
         }
       }
     }
   }
+
+  // 站点适配层声明的伴音轨：网络层抓到的同轨镜像（主机 / 路径前缀不同，轨道编号一致）
+  // 也标记为伴音轨，否则它们会被当成视频轨，可能被选成代表条目（只有声音）。
+  const declaredAudioKeys = new Set<string>();
+  (payload.audioUrls || []).forEach(url => {
+    if (url) declaredAudioKeys.add(mediaTrackFingerprint(url));
+  });
 
   const candidates: Candidate[] = [];
   rawVideos.forEach(raw => {
@@ -562,6 +610,15 @@ export async function scrapeMedia(payload: RawScrapePayload): Promise<ScrapeOutc
     }
     candidates.push(candidate);
   });
+
+  if (declaredAudioKeys.size) {
+    candidates.forEach(candidate => {
+      if (candidate.declaredAudio) return;
+      if (declaredAudioKeys.has(mediaTrackFingerprint(candidate.url))) {
+        candidate.declaredAudio = true;
+      }
+    });
+  }
 
   // 分片收口：把页面脚本漏掉的分片（DOM/JSON 来源、hash 命名）剔除，避免列表被重复分片挤满
   const kept = dropSegments(candidates);

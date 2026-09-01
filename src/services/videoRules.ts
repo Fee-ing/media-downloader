@@ -165,16 +165,57 @@ export function segmentKeyOf(url: string): string | null {
 }
 
 /**
- * DASH 音视频轨道组键：同目录（忽略 host）+ 同文件名前缀（去掉末尾 1~7 位数字编号）。
+ * 路径分段（去掉协议、主机与查询串）。
  *
- * 同一 DASH 流的不同清晰度/码率轨通常共用目录与前缀，只有尾部编号不同
- * （如 B 站 30280 / 30216 / 64 / 32）；不同视频的流 ID 一般就在目录或
- * 前缀里，不会撞到一起。用于「元数据残缺（时长/分辨率未知、体积不同）的
- * m4s/m4a/aac 是否同源」的判定。
+ * 同一条媒体的地址在不同 CDN 节点上路径前缀可能不同：B 站 playinfo 给出的是
+ * `xxx.mcdn.bilivideo.cn:8082/v1/resource/upgcxcode/...`，而播放器实际请求的是
+ * 边缘节点 `xxx.edge.mountaintoys.cn:4483/upgcxcode/...`（少了 `/v1/resource`）。
+ * 一旦用「主机 + 完整路径」做分组键，同一条视频的音视频轨就会被拆成两组：
+ * 音轨配对丢失 → 播放无声、下载只拿到视频轨。
  *
- * 刻意忽略 host：视频 CDN 常用多镜像节点，同一条视频的音视频轨会落在
- * 不同子域（如 B 站 upos-sz-mirrorcos / mirror08c），路径与文件名完全一致。
- * 若把 host 计入 key，同一条视频的轨道会被拆散，导致无法折叠。
+ * CDN 差异几乎只出现在前缀（节点名 / 版本目录），而媒体自身的目录（B 站是
+ * av/cid 目录）与文件名一定落在路径尾部，因此统一截取路径最后 N 段做比较：
+ * 既能跨节点归并，又不会把不同视频并到一起。
+ */
+const PATH_TAIL_SEGMENTS = 3;
+
+function pathSegments(url: string): string[] {
+  const plain = url.split('#')[0].split('?')[0];
+  const path = plain.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, '');
+  return path.split('/').filter(part => part.length > 0);
+}
+
+/** 路径尾部若干段（含文件名） */
+function pathTail(url: string, segments = PATH_TAIL_SEGMENTS): string[] {
+  const parts = pathSegments(url);
+  return parts.slice(Math.max(0, parts.length - segments));
+}
+
+/** 去掉文件名末尾 1~8 位编号（清晰度 / 轨道号），全为数字时保留原值 */
+function stripTrailingNumber(base: string): string {
+  return base.replace(/[0-9]{1,8}$/, '') || base;
+}
+
+/** 由路径尾段拼出指纹键：末段已去掉扩展名 */
+function tailKey(tail: string[], keepTrailingNumber: boolean): string {
+  const parts = tail.slice();
+  const last = parts[parts.length - 1].replace(/\.[a-zA-Z0-9]{2,5}$/, '');
+  parts[parts.length - 1] = keepTrailingNumber ? last : stripTrailingNumber(last);
+  return parts.join('|');
+}
+
+/**
+ * DASH 音视频轨道组键：同目录 + 同文件名前缀（去掉末尾 1~8 位数字编号）的
+ * m4s/m4a/aac。
+ *
+ * 同一 DASH 流的不同清晰度/码率轨共用目录与前缀，只有尾部编号不同
+ * （如 B 站 30280 / 30216 / 30064 / 30080）；不同视频的流 ID 一般就在目录或
+ * 前缀里，不会撞到一起。用于判定「元数据残缺的 m4s/m4a/aac 是否同源」。
+ *
+ * 刻意忽略 host 与路径前缀差异：视频 CDN 常用多镜像节点，音视频轨还会落在
+ * 不同子域（B 站 upos-sz-mirrorcos / mirror08c / mcdn.bilivideo.cn），路径前缀
+ * 也可能不同（有无 /v1/resource）。若把 host 或完整路径计入 key，同一条视频的
+ * 轨道会被拆散，音画配对失效。
  */
 export function m4sTrackKeyOf(url: string): string | null {
   const plain = url.split('#')[0].split('?')[0];
@@ -182,30 +223,35 @@ export function m4sTrackKeyOf(url: string): string | null {
   if (!extMatch) return null;
   const ext = extMatch[1].toLowerCase();
   if (ext !== 'm4s' && ext !== 'm4a' && ext !== 'aac') return null;
-  const base = (plain.split('/').pop() || '').replace(/\.[a-zA-Z0-9]{2,5}$/, '');
-  const num = /^(.*?)([0-9]{1,7})$/.exec(base);
-  // dirOfUrl 含 host；剥离 scheme://host 只保留路径目录，供跨节点分组
-  const pathDir = dirOfUrl(plain).replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, '');
-  return `${pathDir}|${num ? num[1] : base}`;
+  const tail = pathTail(url);
+  if (!tail.length) return null;
+  return tailKey(tail, false);
 }
 
 /**
- * 媒体资源指纹：忽略 CDN 主机名与签名 / 变化型查询参数后，仅保留「路径目录 +
- * 文件名前缀（去掉末尾编号）」。用于判断两个 URL 是否为「同一媒体资源的不同
- * CDN 镜像」（例如 B 站 playinfo 里的 bilivideo.cn baseUrl 与播放器实际请求的
- * mountaintoys.cn 边缘节点、Youtube 的 googlevideo 多节点等）。
+ * 媒体资源指纹：忽略 CDN 主机名、路径前缀与签名 / 变化型查询参数后，仅保留
+ * 「路径尾部目录 + 文件名前缀（去掉末尾编号）」。用于判断两个 URL 是否为
+ * 「同一媒体资源的不同 CDN 镜像」（例如 B 站 playinfo 里的 bilivideo.cn baseUrl
+ * 与播放器实际请求的 mountaintoys.cn 边缘节点、Youtube 的 googlevideo 多节点等）。
  *
  * 这样「音画分离时给一个镜像配对的音轨」就能通用地广播给同批的其它镜像，而不必
  * 为每个站点维护一份 CDN 域名白名单。
  */
 export function mediaResourceFingerprint(url: string): string {
-  const plain = url.split('#')[0].split('?')[0];
-  // 去掉常见的签名 / 防重放参数（各站命名不一，这里用「长得像乱码的长 token」兜底）
-  const pathDir = dirOfUrl(plain).replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, '');
-  const fileBase = (plain.split('/').pop() || '').replace(/\.[a-zA-Z0-9]{2,5}$/, '');
-  // 去掉文件名末尾纯数字编号（同资源不同清晰度/分片编号不同）
-  const prefix = fileBase.replace(/[0-9]{1,8}$/, '') || fileBase;
-  return `${pathDir}|${prefix}`;
+  const tail = pathTail(url);
+  return tail.length ? tailKey(tail, false) : url.split('#')[0];
+}
+
+/**
+ * 轨道级指纹：与 mediaResourceFingerprint 相同，但**保留**文件名末尾的编号
+ * ——DASH 里伴音轨与视频轨正是靠这个编号区分（如 B 站的 30280 与 30080）。
+ *
+ * 用于把「站点适配层显式声明的伴音轨」对应到网络层嗅探到的同轨镜像地址：
+ * 同一个音频轨道在不同节点上只有主机与路径前缀不同，编号完全一致。
+ */
+export function mediaTrackFingerprint(url: string): string {
+  const tail = pathTail(url);
+  return tail.length ? tailKey(tail, true) : url.split('#')[0];
 }
 
 /**
@@ -218,17 +264,47 @@ export function isLikelyMediaCdn(url: string): boolean {
   return RE.mediaHost.test(h);
 }
 
-/** 是否为伴音轨：探测后的 Content-Type 最可靠，其次 URL 与发起者特征 */
+/**
+ * 是否为伴音轨：站点适配层的显式声明最可靠，其次是探测后的 Content-Type，
+ * 再次是 URL 与发起者特征。
+ *
+ * DASH 的伴音轨多为 .m4s，URL 里没有 audio 字样、Content-Type 也常是
+ * video/mp4 或 octet-stream，纯靠 URL/响应头特征判不出来：音轨会被当成视频轨
+ * 选成代表条目（只有声音没有画面）或塞进播放兜底链。因此只要上游（页面脚本的
+ * 站点适配层）明确声明过这是音轨，这里直接采信。
+ */
 export function isAudioTrackLike(item: {
   contentType?: string;
   initiator?: string;
   url: string;
+  declaredAudio?: boolean;
 }): boolean {
+  if (item.declaredAudio) return true;
   const ct = (item.contentType || '').toLowerCase();
   if (ct.indexOf('audio/') === 0) return true;
   if (item.initiator === 'audio') return true;
   if (/(?:^|[/._-])audio(?:[/._-]|$)/i.test(item.url)) return true;
   return /\.(?:m4a|aac)(?:[?#]|$)/i.test(item.url);
+}
+
+/**
+ * 合并伴音轨地址：已有配对（站点适配层 / 指纹广播给的）排在前，新识别到的排在后，去重。
+ *
+ * 关键：**新识别出 0 条时必须原样返回已有配对**，不能返回空数组。DASH 音轨多为
+ * .m4s，靠 URL / Content-Type 往往判不出来，一旦用空结果覆盖，上游辛苦配上的
+ * 音轨就没了 —— 最终表现为「播放无声 + 下载只拿到视频轨」。
+ */
+export function mergeAudioTrackUrls(
+  previous: string[] | undefined,
+  detected: string[],
+): string[] {
+  const out: string[] = [];
+  const push = (url?: string) => {
+    if (url && out.indexOf(url) < 0) out.push(url);
+  };
+  (previous || []).forEach(push);
+  detected.forEach(push);
+  return out;
 }
 
 /**
@@ -321,7 +397,8 @@ function compareKeeper(a: MediaItem, b: MediaItem): number {
 function pickKeeper(group: MediaItem[]): MediaItem {
   let best = group[0];
   for (let i = 1; i < group.length; i++) {
-    if (compareKeeper(best, group[i]) < 0) best = group[i];
+    // compareKeeper(best, candidate) > 0 表示 candidate 更值得保留（更清晰/体积更大）
+    if (compareKeeper(best, group[i]) > 0) best = group[i];
   }
   return best;
 }
@@ -419,9 +496,15 @@ export function dedupeProbedVideos(items: MediaItem[]): MediaItem[] {
     variants.forEach(item => mergeInto(keeper, item));
     // 记录轨道组信息：总轨道数 / 伴音轨地址 / 备用轨道地址（播放失败时按序兜底）
     keeper.trackCount = group.length;
-    keeper.audioTrackUrls = audio.map(item => item.url);
+    // 已配对的音轨（上游站点适配 / 指纹广播给的）优先保留在前，本轮识别到的排后面。
+    // 关键点：本轮识别出 0 条时不能把已有配对覆盖成空数组，否则音画配对会被清掉
     const audioTrack = audio[0];
-    if (audioTrack) keeper.audioTrackUrl = audioTrack.url;
+    keeper.audioTrackUrls = mergeAudioTrackUrls(
+      keeper.audioTrackUrls || (keeper.audioTrackUrl ? [keeper.audioTrackUrl] : undefined),
+      audio.map(item => item.url),
+    );
+    if (keeper.audioTrackUrls.length) keeper.audioTrackUrl = keeper.audioTrackUrls[0];
+    else if (audioTrack) keeper.audioTrackUrl = audioTrack.url;
     keeper.variantUrls = variants
       .filter(item => item !== audioTrack && !isAudioTrackLike(item))
       .map(item => item.url);
