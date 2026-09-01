@@ -183,6 +183,18 @@ export default function App() {
       // 唯一的抓取入口：页面脚本的候选在这里归一、过滤、去重、排序。
       let { images: nextImages, videos: nextVideos, hint, stats } = await scrapeMedia(payload);
 
+      // [诊断] B 站音画分离排查：打印 playinfo 是否识别、首条视频是否带音轨与防盗链头
+      console.log('[BILI-DEBUG]', JSON.stringify(stats?.biliDebug || null));
+      console.log('[BILI-DEBUG] first video:', nextVideos[0]
+        ? JSON.stringify({
+            url: nextVideos[0].url?.slice(0, 80),
+            audioTrackUrl: nextVideos[0].audioTrackUrl ? nextVideos[0].audioTrackUrl.slice(0, 80) : null,
+            audioTrackUrls: (nextVideos[0].audioTrackUrls || []).map((u: string) => u.slice(0, 80)),
+            headers: nextVideos[0].headers || null,
+            playback: nextVideos[0].playback,
+          })
+        : 'none');
+
       if (!nextImages.length && !nextVideos.length) {
         setProgress({
           phase: 'error',

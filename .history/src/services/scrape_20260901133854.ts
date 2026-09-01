@@ -467,6 +467,9 @@ function attachAntiLeechHeaders(c: Candidate, payload: RawScrapePayload): Candid
     }
   }
   if (!Object.keys(extra).length) return c;
+  if (!sameHost) {
+    console.log('[ANTI-LEECH] attached headers for', targetHost, extra);
+  }
   return { ...c, headers: { ...(c.headers || {}), ...extra } };
 }
 
