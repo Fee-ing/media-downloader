@@ -27,8 +27,9 @@ import { COLORS, DESKTOP_UA, GAP, PAGE_PADDING, TIMING } from '../constants';
 import {
   EXTRACT_SCRIPT,
   PROBE_STATE_SCRIPT,
-  SETUP_SCRIPT,
+  buildSetupScript,
 } from '../services/extractor';
+import { matchAdapter } from '../services/sites';
 import type { RawScrapePayload, ScrapeProgress } from '../types';
 
 // ============================================================
@@ -313,18 +314,18 @@ export default function BrowserStyleWebView({
   const redirectChainRef = useRef<string[]>([]);
   const currentUrlRef = useRef(url);
 
-  // 抖音风控计数：域名命中即启用拉回逻辑（作品页/分享页的路径由 isDouyinOkUrl 判定）
+  // 抖音风控计数
   const redirectCountRef = useRef(0);
   const isDouyin = useMemo(() => {
     try {
-      return DOUYIN_OK_HOST.test(new URL(url).hostname);
+      return matchAdapter(url)?.id === 'douyin';
     } catch {
       return false;
     }
   }, [url]);
 
   // 构建注入脚本
-  const setupScript = SETUP_SCRIPT;
+  const setupScript = useMemo(() => buildSetupScript(url), [url]);
 
   // 清理定时器
   const clearAllTimeouts = useCallback(() => {
@@ -679,7 +680,7 @@ export default function BrowserStyleWebView({
         source={{ uri: webViewState.url }}
         style={styles.webview}
         automaticallyAdjustContentInsets={false}
-        contentMode="mobile"
+        contentMode="desktop"
         userAgent={DESKTOP_UA}
         injectedJavaScript={`${STEALTH_SCRIPT}\n${MUTE_MEDIA_SCRIPT}\n${setupScript}`}
         injectedJavaScriptBeforeContentLoaded={`${STEALTH_SCRIPT}\n${MUTE_MEDIA_SCRIPT}`}

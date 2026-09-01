@@ -88,8 +88,14 @@ export interface RawScrapePayload {
   cookie?: string;
   /** 页面是否通过 MSE 播放（blob: 源） */
   mse?: boolean;
+  /** MSE 注册过的 codec（如 video/mp4;codecs="avc1.64001f"），用于诊断 */
+  mseMimes?: string[];
   /** 使用 blob: 源、拿不到直链的视频数量 */
   blobVideos?: number;
+  /** srcObject（MediaStream / WebRTC）视频数量 */
+  streamVideos?: number;
+  /** 网络层捕获到的媒体请求数 */
+  networkCount?: number;
   images: Array<{
     url: string;
     w?: number;
@@ -115,8 +121,15 @@ export interface RawScrapePayload {
     headers?: Record<string, string>;
     /** 由网络层请求捕获（非 DOM 节点） */
     viaNetwork?: boolean;
+    /**
+     * 请求发起者：video / audio / fetch / xmlhttprequest。
+     * 来自 Resource Timing 的 initiatorType，是无扩展名直链最硬的证据。
+     */
+    initiator?: string;
     /** 页面内 <video> 试播是否成功 */
     probeOk?: boolean;
+    /** 页面脚本给出的置信度（RN 侧会重算，主要用于页面内的探测排序） */
+    score?: number;
   }>;
 }
 

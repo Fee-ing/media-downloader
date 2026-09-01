@@ -1,57 +1,73 @@
 /**
  * 注入到 WebView 页面中的采集脚本。
  *
- * 分两步：
- * 1. SETUP_SCRIPT 随页面加载注入，挂载 window.__MD__ 工具集；
- * 2. 页面加载完成（或超时兜底）后，调用 window.__MD__.extract() 采集并回传结果。
+ * 分三步：
+ * 1. SHARED_SNIPPET 随页面加载注入，挂载 window.__MD__ 工具集与共用规则；
+ * 2. NET_SNIPPET 立刻安装网络层钩子，覆盖页面加载初期的媒体请求；
+ * 3. 页面加载完成（或超时兜底）后调用 window.__MD__.extract() 采集并回传。
+ *
+ * 视频采集按「四层漏斗」组织，所有来源最终都汇进同一个 addVideo：
+ *
+ *   ① DOM        <video>/<source>/<embed>     —— 最可信，但只有当前在播的那条
+ *   ② 结构化数据 JSON-LD / og:video / preload —— 站点主动声明的地址
+ *   ③ 网络层     PerformanceObserver/fetch/XHR —— 覆盖懒加载与无扩展名 CDN 直链
+ *   ④ 数据层     接口 JSON / 页面内嵌 STATE   —— 只在接口响应体里出现的地址
+ *
+ * 不区分站点：靠「证据」判定而不是域名白名单。
+ * 过去为抖音 / B 站 / 小红书写的专属取数逻辑，本质都是两件对所有站点都成立的事——
+ * 「接口响应体里翻直链」与「页面内嵌 STATE 里翻直链」，已由第 ④ 层统一承担。
+ *
+ * 对应 FetchV 扩展的：网络层用 webRequest 抓 media/xhr/object/other，
+ * 拿不准时回问内容脚本（CHECK_VIDEO_SRC / CHECK_TEXT_CONTENT），
+ * 这里则是「网络层拿不全就往 DOM 与接口响应体里翻」，思路一致、手段换成页面内钩子。
  *
  * 注意：脚本为纯 ES5 风格，避免老旧 WebView 内核语法报错。
  */
 
-import { SITE_PAGE_SCRIPTS } from './sites';
+import { PAGE_RULES } from './videoRules';
 
-const BASE_SETUP_SCRIPT = `(function () {
+// ============================================================
+// 片段一：共享工具 + 规则 + 候选池
+// ============================================================
+
+const SHARED_SNIPPET = `(function () {
   if (window.__MD__) { return; }
   var MD = (window.__MD__ = {});
-  /** 站点专属采集钩子，由各站点的 pageScript 注册 */
-  MD.sites = [];
+  /** 与 RN 侧共用的判定规则 */
+  MD.RULES = ${JSON.stringify(PAGE_RULES)};
 
-  var IMG_EXT = /\\.(jpe?g|png|gif|webp|avif|bmp|svg|heic|heif|jfif)(\\?|#|$)/i;
-  var VID_EXT = /\\.(mp4|webm|ogv|ogg|mov|m4v|mkv|m3u8|mpd|flv|avi|wmv|ts)(\\?|#|$)/i;
-  var LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url', 'data-echo', 'data-image', 'data-href', 'data-fallback-src'];
-  var SKIP = /(sprite|placeholder|loading\\.gif|blank\\.(png|gif)|1x1|pixel\\.(png|gif)|spacer|icon-)/i;
+  var R = MD.RULES;
+  function rx(src) { try { return new RegExp(src, 'i'); } catch (e) { return /(?!)/; } }
+  var RE = {
+    videoExt: rx(R.videoExt),
+    audioExt: rx(R.audioExt),
+    imageExt: rx(R.imageExt),
+    staticExt: rx(R.staticExt),
+    manifestExt: rx(R.manifestExt),
+    segmentExt: rx(R.segmentExt),
+    mimeHint: rx(R.mimeHint),
+    junkHost: rx(R.junkHost),
+    junkPath: rx(R.junkPath),
+    junkAsset: rx(R.junkAsset),
+    dataApi: rx(R.dataApi),
+    videoKeyStrong: rx(R.videoKeyStrong),
+    videoKeyWeak: rx(R.videoKeyWeak),
+    mediaHost: rx(R.mediaHost),
+    pathEvidence: rx(R.pathEvidence)
+  };
+  MD.RE = RE;
 
-  /**
-   * 从 URL 推断分辨率（仅匹配明确的 宽x高 / w=&h= / 1080p 模式），
-   * 签名 CDN 链接常把清晰度写进地址，可作为容器探测前的兜底。
-   */
-  function resFromUrl(u) {
-    var m, w, h;
-    m = /(?:^|[^0-9])([0-9]{3,4})[xX\\u00d7]([0-9]{3,4})(?:[^0-9]|$)/.exec(u);
-    if (m) {
-      w = parseInt(m[1], 10);
-      h = parseInt(m[2], 10);
-      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
-    }
-    m = /[?&](?:w|width)=([0-9]{3,4})[^&#]*[?&](?:h|height)=([0-9]{3,4})/i.exec(u);
-    if (m) {
-      w = parseInt(m[1], 10);
-      h = parseInt(m[2], 10);
-      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
-    }
-    m = /(?:^|[^0-9])([0-9]{3,4})p(?:[^0-9]|$)/i.exec(u);
-    if (m) {
-      h = parseInt(m[1], 10);
-      if (h >= 300 && h <= 7680) { return { w: Math.round((h * 16) / 9), h: h }; }
-    }
-    return null;
+  var LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url', 'data-echo', 'data-image', 'data-href', 'data-fallback-src', 'data-video-src', 'data-mp4'];
+
+  function hostOf(u) {
+    try { return new URL(u, location.href).hostname.toLowerCase(); } catch (e) { return ''; }
   }
 
   function abs(u) {
     if (!u) { return ''; }
     u = String(u).trim();
     if (!u) { return ''; }
-    if (u.indexOf('data:') === 0 || u.indexOf('blob:') === 0) { return ''; }
+    if (u.indexOf('data:') === 0 || u.indexOf('blob:') === 0 || u.indexOf('javascript:') === 0) { return ''; }
     if (u.indexOf('//') === 0) { u = location.protocol + u; }
     try { return new URL(u, location.href).href; } catch (e) { return ''; }
   }
@@ -112,6 +128,29 @@ const BASE_SETUP_SCRIPT = `(function () {
     return s > 0 ? s : undefined;
   }
 
+  /** 从 URL 推断分辨率（宽x高 / w=&h= / 1080p），容器探测前兜底用 */
+  function resFromUrl(u) {
+    var m, w, h;
+    m = /(?:^|[^0-9])([0-9]{3,4})[xX\\u00d7]([0-9]{3,4})(?:[^0-9]|$)/.exec(u);
+    if (m) {
+      w = parseInt(m[1], 10);
+      h = parseInt(m[2], 10);
+      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
+    }
+    m = /[?&](?:w|width)=([0-9]{3,4})[^&#]*[?&](?:h|height)=([0-9]{3,4})/i.exec(u);
+    if (m) {
+      w = parseInt(m[1], 10);
+      h = parseInt(m[2], 10);
+      if (w >= 300 && w <= 7680 && h >= 300 && h <= 7680) { return { w: w, h: h }; }
+    }
+    m = /(?:^|[^0-9])([0-9]{3,4})p(?:[^0-9]|$)/i.exec(u);
+    if (m) {
+      h = parseInt(m[1], 10);
+      if (h >= 300 && h <= 7680) { return { w: Math.round((h * 16) / 9), h: h }; }
+    }
+    return null;
+  }
+
   function timingMap() {
     var map = {};
     try {
@@ -125,6 +164,56 @@ const BASE_SETUP_SCRIPT = `(function () {
     return map;
   }
 
+  /**
+   * 噪声判定。
+   *
+   * 有媒体扩展名的地址一律不按路径特征误杀：/ad/xxx.mp4 也完全可能是正片，
+   * 真正可信的只有广告 / 统计域这类硬黑名单。
+   */
+  function isJunk(u) {
+    if (!u) { return true; }
+    if (RE.junkAsset.test(u)) { return true; }
+    if (RE.junkHost.test(hostOf(u))) { return true; }
+    if (RE.videoExt.test(u) || RE.audioExt.test(u)) { return false; }
+    if (RE.imageExt.test(u) || RE.staticExt.test(u)) { return false; }
+    return RE.junkPath.test(u);
+  }
+  MD.isJunk = isJunk;
+
+  /**
+   * 候选置信度。
+   *
+   * 列表有上限、可播放性校验也有并发上限，命中上限时只能保留最可能是正片的那些，
+   * 因此每条候选都要带一个分数：来源越可信越高，有元数据 / 有响应头佐证的加分，
+   * 分片与噪声减分。
+   */
+  var WEIGHTS = R.weights || {};
+  function scoreOf(o) {
+    var s = WEIGHTS[o.source] || 50;
+    if (o.contentType) { s += 12; }
+    if (o.initiator === 'video' || o.initiator === 'audio') { s += 20; }
+    if (o.viaNetwork && o.size > 0) { s += 8; }
+    if (o.duration) { s += 6; }
+    if (o.w && o.h) { s += 6; }
+    if (o.poster) { s += 4; }
+    if (o.title) { s += 3; }
+    if (o.fallbackUrl) { s += 3; }
+    if (o.isSegment) { s -= 40; }
+    return s;
+  }
+
+  // 后面的片段（网络层、采集）都要复用这些工具，统一挂到 MD 上
+  MD.scoreOf = scoreOf;
+  MD.hostOf = hostOf;
+  MD.abs = abs;
+  MD.text = text;
+  MD.attrFrom = attrFrom;
+  MD.bestSrcset = bestSrcset;
+  MD.nearbyTitle = nearbyTitle;
+  MD.isoDuration = isoDuration;
+  MD.resFromUrl = resFromUrl;
+  MD.timingMap = timingMap;
+
   MD.probeState = function () {
     var total = 0, loaded = 0;
     try {
@@ -134,11 +223,7 @@ const BASE_SETUP_SCRIPT = `(function () {
         if (imgs[i].complete) { loaded++; }
       }
     } catch (e) {}
-    return {
-      ready: document.readyState,
-      imgTotal: total,
-      imgLoaded: loaded
-    };
+    return { ready: document.readyState, imgTotal: total, imgLoaded: loaded };
   };
 
   /** 模拟滚动，触发懒加载；到底或超时后回到顶部 */
@@ -215,182 +300,14 @@ const BASE_SETUP_SCRIPT = `(function () {
   };
 
   /**
-   * 网络层嗅探：记录页面运行期间真正发出的媒体请求。
-   * 对应 FetchV 扩展里 webRequest.onResponseStarted 的拦截能力——
-   * HLS 清单、XHR/fetch 拉取的 mp4、懒加载视频都不会出现在 DOM 里，只能从这里捞。
-   */
-  var NET_VID_EXT = /\\.(m3u8|m3u|mpd|mp4|m4v|m4s|mov|webm|mkv|ogv|ogg|flv|avi|wmv)(\\?|#|$)/i;
-  // 抖音这类 CDN 的直链没有扩展名，只在参数里声明类型（?mime_type=video_mp4）
-  var NET_VID_HINT = /[?&]mime_type=video_/i;
-  var NET_MAX = 120;
-  MD.net = { entries: [], mse: 0, mseMime: '', started: false };
-
-  /**
-   * 数据接口的响应体（对应 FetchV 的 CHECK_TEXT_CONTENT）：
-   * 直链往往藏在 JSON 响应（playurl / detail / feed 等）或 HLS 清单文本里，
-   * 只记 URL 拿不到。这里保存候选接口的响应体，collect 阶段统一解析。
-   */
-  var PAYLOAD_MAX = 30;
-  var PAYLOAD_SIZE_MAX = 1500000;
-  MD.payloads = [];
-  MD.pushPayload = function (u, text) {
-    try {
-      if (!u || !text) { return; }
-      var full = abs(u);
-      if (!full || full.indexOf('http') !== 0) { return; }
-      if (text.length > PAYLOAD_SIZE_MAX) { return; }
-      var i;
-      for (i = 0; i < MD.payloads.length; i++) {
-        if (MD.payloads[i].url === full) { return; }
-      }
-      if (MD.payloads.length >= PAYLOAD_MAX) { return; }
-      var type = '';
-      var json = null;
-      if (text.indexOf('#EXTM3U') === 0) {
-        type = 'manifest';
-      } else if (text.indexOf('{') === 0 || text.indexOf('[') === 0) {
-        try { json = JSON.parse(text); type = 'json'; } catch (e) { type = ''; }
-      }
-      if (!type) { return; }
-      MD.payloads.push({ url: full, type: type, text: text, json: json });
-    } catch (e) {}
-  };
-
-  /**
-   * 候选数据接口：响应体可能是 JSON（内含视频直链）或 HLS 清单文本。
-   * 媒体直链与静态资源不在此列，避免无谓的响应体读取开销。
-   */
-  function isDataUrl(u) {
-    var full = abs(u);
-    if (!full || full.indexOf('http') !== 0) { return false; }
-    if (SKIP.test(full)) { return false; }
-    if (NET_VID_EXT.test(full) || NET_VID_HINT.test(full)) { return false; }
-    if (/\\.(jpe?g|png|gif|webp|bmp|avif|svg|ico|css|js|woff2?|ttf|eot)([?#]|$)/i.test(full)) { return false; }
-    // playurl / view 等接口以 "?bvid=..." 结尾，所以分隔符放宽到 /、? 或结尾
-    return /\\/(api|ajax|sns\\/web|aweme|playurl|detail|feed|discovery|item|note|view|recommend|search|graphql)(\\/|\\?|$)|\\/x\\/player\\//i.test(full);
-  }
-
-  MD.netPush = function (u, extra) {
-    try {
-      if (!u) return;
-      var full = abs(u);
-      if (!full || full.indexOf('http') !== 0) return;
-      if (!(NET_VID_EXT.test(full) || NET_VID_HINT.test(full)) || SKIP.test(full)) return;
-      var i;
-      for (i = 0; i < MD.net.entries.length; i++) {
-        if (MD.net.entries[i].url === full) return;
-      }
-      if (MD.net.entries.length >= NET_MAX) return;
-      var entry = { url: full, size: 0 };
-      if (extra) { for (var k in extra) { if (k !== 'url') entry[k] = extra[k]; } }
-      MD.net.entries.push(entry);
-    } catch (e) {}
-  };
-
-  MD.startNet = function () {
-    if (MD.net.started) return;
-    MD.net.started = true;
-
-    // 1) Resource Timing：覆盖 <video>/XHR/fetch 等各类请求，还能拿到真实体积
-    try {
-      if (window.PerformanceObserver) {
-        var po = new PerformanceObserver(function (list) {
-          try {
-            var items = list.getEntries ? list.getEntries() : [];
-            for (var i = 0; i < items.length; i++) {
-              var e = items[i];
-              var size = e.encodedBodySize || e.decodedBodySize || e.transferSize || 0;
-              MD.netPush(e.name, { size: size, initiator: e.initiatorType || '', viaNetwork: true });
-            }
-          } catch (err) {}
-        });
-        po.observe({ entryTypes: ['resource'] });
-      }
-    } catch (e) {}
-
-    // 2) fetch
-    try {
-      var originFetch = window.fetch;
-      if (typeof originFetch === 'function') {
-        window.fetch = function (input) {
-          try {
-            var u = typeof input === 'string' ? input : (input && input.url) || '';
-            MD.netPush(u, { initiator: 'fetch', viaNetwork: true });
-            if (isDataUrl(u)) {
-              // 数据接口：异步读响应体，供 collect 解析（HLS 清单 / JSON 直链）
-              var pending = originFetch.apply(this, arguments);
-              try {
-                if (pending && typeof pending.then === 'function') {
-                  pending.then(function (res) {
-                    try {
-                      if (!res || !res.ok) { return; }
-                      var fu = res.url || u;
-                      if (!isDataUrl(fu)) { return; }
-                      var copy = res.clone();
-                      if (copy && typeof copy.text === 'function') {
-                        copy.text().then(function (t) { MD.pushPayload(fu, t); });
-                      }
-                    } catch (e) {}
-                    return res;
-                  });
-                }
-              } catch (e) {}
-              return pending;
-            }
-          } catch (err) {}
-          return originFetch.apply(this, arguments);
-        };
-      }
-    } catch (e) {}
-
-    // 3) XMLHttpRequest
-    try {
-      var originOpen = XMLHttpRequest.prototype.open;
-      var originSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function (method, u) {
-        try { this.__mdUrl = String(u || ''); MD.netPush(u, { initiator: 'xmlhttprequest', viaNetwork: true }); } catch (err) {}
-        return originOpen.apply(this, arguments);
-      };
-      XMLHttpRequest.prototype.send = function () {
-        try {
-          var self = this;
-          var xhrUrl = self.__mdUrl || '';
-          if (isDataUrl(xhrUrl)) {
-            self.addEventListener('load', function () {
-              try {
-                if (self.readyState !== 4) { return; }
-                MD.pushPayload(xhrUrl, self.responseText || '');
-              } catch (e) {}
-            });
-          }
-        } catch (e) {}
-        return originSend.apply(this, arguments);
-      };
-    } catch (e) {}
-
-    // 4) MSE：页面用 MediaSource 播放时，视频是脚本合成的内存流，没有直链
-    try {
-      if (window.MediaSource && MediaSource.prototype.addSourceBuffer) {
-        var originAdd = MediaSource.prototype.addSourceBuffer;
-        MediaSource.prototype.addSourceBuffer = function (mime) {
-          try { MD.net.mse += 1; MD.net.mseMime = String(mime); } catch (err) {}
-          return originAdd.apply(this, arguments);
-        };
-      }
-    } catch (e) {}
-  };
-  MD.startNet();
-
-  /**
    * 生成往指定结果集里追加图片 / 视频的函数。
-   * 站点钩子在 collect 之后运行，也要走同一套去重与补全逻辑，
-   * 因此把这两个函数从 collect 的闭包里提出来复用。
+   * 采集的各层都要走同一套去重与补全逻辑，因此从 collect 的闭包里提出来复用。
    */
   function makeAdder(out, seen, timing) {
     return {
       addImage: function (o) {
         o.url = abs(o.url);
-        if (!o.url || seen['i' + o.url] || SKIP.test(o.url)) { return; }
+        if (!o.url || seen['i' + o.url] || isJunk(o.url)) { return; }
         seen['i' + o.url] = true;
         o.w = o.w > 0 ? Math.round(o.w) : 0;
         o.h = o.h > 0 ? Math.round(o.h) : 0;
@@ -400,7 +317,7 @@ const BASE_SETUP_SCRIPT = `(function () {
       },
       addVideo: function (o) {
         o.url = abs(o.url);
-        if (!o.url || seen['v' + o.url] || SKIP.test(o.url)) { return; }
+        if (!o.url || seen['v' + o.url] || isJunk(o.url)) { return; }
         seen['v' + o.url] = true;
         o.w = o.w > 0 ? Math.round(o.w) : 0;
         o.h = o.h > 0 ? Math.round(o.h) : 0;
@@ -413,48 +330,13 @@ const BASE_SETUP_SCRIPT = `(function () {
           }
         }
         if (!o.size) { o.size = timing[o.url]; }
+        if (!o.score) { o.score = scoreOf(o); }
         out.videos.push(o);
-      },
-      /**
-       * 按 URL 特征批量移除视频并解除去重标记。
-       * 站点钩子拿接口全量数据时，用它将通用层扫到的本站裸条目「替换」成精选条目，
-       * 否则被移除的 URL 仍占着去重标记，精选条目加不进来。
-       */
-      removeVideosBy: function (test) {
-        var removed = [];
-        var i = 0;
-        while (i < out.videos.length) {
-          var u = out.videos[i].url;
-          if (test(u)) {
-            removed.push(u);
-            out.videos.splice(i, 1);
-          } else {
-            i++;
-          }
-        }
-        for (var j = 0; j < removed.length; j++) {
-          delete seen['v' + removed[j]];
-        }
       },
     };
   }
 
-  /**
-   * 判定站点归属时使用的地址。
-   *
-   * 默认是当前页面地址，但页面可能已经跳转：抖音在触发风控时会跳到 /jingxuan
-   * （推荐流），此时 location 不再指向用户要抓的作品。用户输入的原始地址才是真实意图，
-   * 因此优先采用它——即便页面跳转，也能按作品页继续处理。
-   */
-  MD.pageHref = function () {
-    try {
-      return window.__MD_TASK_URL__ || location.href;
-    } catch (e) {
-      return '';
-    }
-  };
-
-  /** 按结果集缓存追加函数，保证同一轮采集里 DOM 阶段与站点阶段共用一份去重表 */
+  /** 按结果集缓存追加函数，保证同一轮采集里各阶段共用一份去重表 */
   var adderCache = [];
   MD.adderFor = function (out) {
     for (var i = 0; i < adderCache.length; i++) {
@@ -465,13 +347,449 @@ const BASE_SETUP_SCRIPT = `(function () {
     return adder;
   };
 
+  /**
+   * 可遍历的文档根：主文档 + 同源 iframe + 打开的 Shadow DOM。
+   * 视频播放器常被塞进 iframe 或 Web Component，只扫 document 会整片漏掉。
+   */
+  MD.roots = function () {
+    var roots = [document];
+    var i;
+    try {
+      var frames = document.querySelectorAll('iframe');
+      var fn = Math.min(frames.length, 5);
+      for (i = 0; i < fn; i++) {
+        try {
+          var d = frames[i].contentDocument;
+          if (d && d.querySelector) { roots.push(d); }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    try {
+      var all = document.querySelectorAll('*');
+      var cap = Math.min(all.length, 3000);
+      var found = 0;
+      for (i = 0; i < cap && found < 10; i++) {
+        var sr = null;
+        try { sr = all[i].shadowRoot; } catch (e) {}
+        if (sr && sr.querySelector) { roots.push(sr); found++; }
+      }
+    } catch (e) {}
+    return roots;
+  };
+
+  /** 在所有文档根里查询同一选择器 */
+  MD.queryAll = function (selector) {
+    var roots = MD.roots();
+    var out = [];
+    for (var i = 0; i < roots.length; i++) {
+      try {
+        var list = roots[i].querySelectorAll(selector);
+        for (var j = 0; j < list.length; j++) { out.push(list[j]); }
+      } catch (e) {}
+    }
+    return out;
+  };
+
+  return true;
+})();`;
+
+// ============================================================
+// 片段二：网络层嗅探
+// ============================================================
+
+const NET_SNIPPET = `(function () {
+  var MD = window.__MD__;
+  if (!MD) { return; }
+  var RE = MD.RE;
+
+  var NET_MAX = 200;
+  var PAYLOAD_MAX = 30;
+  var PAYLOAD_SIZE_MAX = 800000;
+
+  var NET = (MD.net = {
+    entries: [],
+    index: {},
+    payloads: [],
+    /** MediaSource.addSourceBuffer 调用次数（>0 即页面走 MSE） */
+    mse: 0,
+    mseMimes: [],
+    /** 通过 MSE 追加的数据量，用于判断是否真的在合成视频 */
+    appendBytes: 0,
+    /** createObjectURL 调用次数 */
+    blobs: 0,
+    /** 被转成 Blob 再喂给 <video> 的媒体字节数 */
+    mediaBlobBytes: 0,
+    /** video.srcObject（MediaStream，如 WebRTC 直播）次数 */
+    streams: 0,
+    started: false
+  });
+  /** 兼容旧命名：早期脚本与站点钩子直接读 MD.payloads */
+  MD.payloads = NET.payloads;
+
+  function contentTypeOf(res) {
+    try {
+      if (res && res.headers && typeof res.headers.get === 'function') {
+        return String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  function sizeOfRes(res) {
+    try {
+      if (res && res.headers && typeof res.headers.get === 'function') {
+        var cr = res.headers.get('content-range');
+        if (cr) {
+          var m = /\\/([0-9]+)\\s*$/.exec(cr);
+          if (m) { return parseInt(m[1], 10) || 0; }
+        }
+        var cl = res.headers.get('content-length');
+        if (cl) { return parseInt(cl, 10) || 0; }
+      }
+    } catch (e) {}
+    return 0;
+  }
+
+  /**
+   * 是否算媒体请求。
+   *
+   * 三条证据，任中其一即可：
+   * - initiatorType 是 video / audio（浏览器替 <video> 发的请求，铁证，
+   *   无扩展名的 CDN 直链全靠这一条捞出来）；
+   * - 响应头 Content-Type 是 video/* / audio/* / HLS / DASH；
+   * - URL 自带媒体扩展名，或参数里声明了 mime_type=video_mp4 之类。
+   *
+   * 注意 application/octet-stream 必须配合扩展名才认，否则任何二进制都会被当成视频。
+   */
+  function looksLikeMedia(u, contentType, initiator) {
+    if (initiator === 'video' || initiator === 'audio') { return true; }
+    var ct = String(contentType || '').toLowerCase();
+    if (/^(video|audio)\\//.test(ct)) { return true; }
+    if (/mpegurl|dash\\+xml/.test(ct)) { return true; }
+    if (RE.videoExt.test(u) || RE.audioExt.test(u)) { return true; }
+    if (RE.mimeHint.test(u)) { return true; }
+    return false;
+  }
+
+  /** 记录一条网络请求；同一 URL 的多次记录会合并补全 */
+  function netAdd(u, extra) {
+    if (!u) { return null; }
+    var full = '';
+    try { full = new URL(u, location.href).href; } catch (e) { return null; }
+    if (!full || full.indexOf('http') !== 0) { return null; }
+    if (MD.isJunk(full)) { return null; }
+    var key = full.split('#')[0];
+    var existing = NET.index[key];
+    var k;
+    if (existing) {
+      // 响应头往往晚于请求到达，后到的信息只用来补空，不覆盖已有值
+      for (k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) {
+          if (existing[k] === undefined || existing[k] === '' || existing[k] === 0) {
+            existing[k] = extra[k];
+          }
+        }
+      }
+      return existing;
+    }
+    if (NET.entries.length >= NET_MAX) { return null; }
+    var entry = { url: full, size: 0, contentType: '', initiator: '', viaNetwork: true };
+    for (k in extra) {
+      if (Object.prototype.hasOwnProperty.call(extra, k) && k !== 'url') { entry[k] = extra[k]; }
+    }
+    NET.index[key] = entry;
+    NET.entries.push(entry);
+    return entry;
+  }
+
+  MD.netPush = function (u, extra) {
+    var info = extra || {};
+    if (!u) { return null; }
+    if (!looksLikeMedia(u, info.contentType, info.initiator)) { return null; }
+    return netAdd(u, info);
+  };
+
+  /**
+   * 数据接口的响应体。
+   *
+   * 直链往往藏在 JSON 响应（playurl / detail / feed）或 HLS 清单文本里，
+   * 只记 URL 拿不到。这里保存候选接口的响应体，collect 阶段统一解析
+   * （对应 FetchV 的 CHECK_TEXT_CONTENT）。
+   */
+  MD.pushPayload = function (u, body, contentType) {
+    try {
+      if (!u || !body) { return; }
+      var ct = String(contentType || '').toLowerCase();
+      // 二进制响应没有扫描价值，读回来只是白耗内存
+      if (ct && (/^(video|audio|image|font)\\//.test(ct) || /octet-stream|zip|pdf|wasm/.test(ct))) { return; }
+      if (body.length > PAYLOAD_SIZE_MAX) { return; }
+      var full = '';
+      try { full = new URL(u, location.href).href; } catch (e) { return; }
+      if (!full || full.indexOf('http') !== 0) { return; }
+      if (MD.isJunk(full)) { return; }
+      var i;
+      for (i = 0; i < NET.payloads.length; i++) {
+        if (NET.payloads[i].url === full) { return; }
+      }
+      if (NET.payloads.length >= PAYLOAD_MAX) { return; }
+      var head = body.replace(/^\\uFEFF/, '').replace(/^\\s+/, '');
+      var type = '';
+      var json = null;
+      if (head.indexOf('#EXTM3U') === 0) {
+        type = 'manifest';
+      } else if (head.charAt(0) === '{' || head.charAt(0) === '[') {
+        try { json = JSON.parse(body); type = 'json'; } catch (e) { return; }
+      }
+      if (!type) { return; }
+      NET.payloads.push({ url: full, type: type, text: body, json: json });
+    } catch (e) {}
+  };
+
+  /** 是否值得读响应体：媒体直链与静态资源不必读 */
+  function isDataUrl(u, contentType) {
+    var full = '';
+    try { full = new URL(u, location.href).href; } catch (e) { return false; }
+    if (!full || full.indexOf('http') !== 0) { return false; }
+    if (MD.isJunk(full)) { return false; }
+    if (RE.videoExt.test(full) || RE.audioExt.test(full) || RE.mimeHint.test(full)) { return false; }
+    if (RE.imageExt.test(full) || RE.staticExt.test(full)) { return false; }
+    var ct = String(contentType || '').toLowerCase();
+    if (ct) {
+      if (/^(video|audio|image|font)\\//.test(ct) || /octet-stream|zip|pdf|wasm/.test(ct)) { return false; }
+      // 只认文本型响应
+      if (!(ct.indexOf('text/') === 0 || ct.indexOf('json') >= 0 || ct.indexOf('javascript') >= 0 || ct.indexOf('xml') >= 0)) { return false; }
+    }
+    return RE.dataApi.test(full);
+  }
+
+  MD.startNet = function () {
+    if (NET.started) { return; }
+    NET.started = true;
+
+    // 1) Resource Timing：覆盖 <video>/XHR/fetch 等各类请求，还能拿到真实体积与 initiatorType
+    try {
+      if (window.PerformanceObserver) {
+        var po = new PerformanceObserver(function (list) {
+          var items = [];
+          try { items = list.getEntries ? list.getEntries() : []; } catch (e) { return; }
+          for (var i = 0; i < items.length; i++) {
+            var e = items[i];
+            var size = e.encodedBodySize || e.decodedBodySize || e.transferSize || 0;
+            MD.netPush(e.name, {
+              size: size,
+              initiator: e.initiatorType || '',
+            });
+          }
+        });
+        po.observe({ entryTypes: ['resource'] });
+      }
+    } catch (e) {}
+
+    // 2) fetch：顺带读响应头（同源 / CORS 暴露时能拿到 Content-Type 与体积）
+    try {
+      var originFetch = window.fetch;
+      if (typeof originFetch === 'function') {
+        window.fetch = function (input) {
+          var u = '';
+          try { u = typeof input === 'string' ? input : (input && input.url) || ''; } catch (e) {}
+          var pending = originFetch.apply(this, arguments);
+          try {
+            if (u && pending && typeof pending.then === 'function') {
+              pending.then(function (res) {
+                try {
+                  if (res) {
+                    var finalUrl = res.url || u;
+                    var ct = contentTypeOf(res);
+                    MD.netPush(finalUrl, {
+                      contentType: ct,
+                      size: sizeOfRes(res),
+                      initiator: 'fetch',
+                      method: 'GET'
+                    });
+                    if (res.ok && isDataUrl(finalUrl, ct)) {
+                      var copy = res.clone && res.clone();
+                      if (copy && typeof copy.text === 'function') {
+                        copy.text().then(function (t) { MD.pushPayload(finalUrl, t, ct); }, function () {});
+                      }
+                    }
+                  }
+                } catch (err) {}
+                return res;
+              }, function () {});
+            }
+          } catch (err) {}
+          return pending;
+        };
+      }
+    } catch (e) {}
+
+    // 3) XMLHttpRequest
+    try {
+      var XP = XMLHttpRequest.prototype;
+      var originOpen = XP.open;
+      var originSend = XP.send;
+      XP.open = function (method, u) {
+        try {
+          this.__mdUrl = String(u || '');
+          this.__mdMethod = String(method || 'GET').toUpperCase();
+        } catch (e) {}
+        return originOpen.apply(this, arguments);
+      };
+      XP.send = function () {
+        try {
+          var self = this;
+          self.addEventListener('loadend', function () {
+            try {
+              var u = self.__mdUrl || '';
+              var ct = '';
+              var len = 0;
+              try { ct = String(self.getResponseHeader('Content-Type') || '').split(';')[0].trim().toLowerCase(); } catch (e) {}
+              try { len = parseInt(self.getResponseHeader('Content-Length') || '0', 10) || 0; } catch (e) {}
+              var finalUrl = self.responseURL || u;
+              MD.netPush(finalUrl, {
+                contentType: ct,
+                size: len,
+                initiator: 'xmlhttprequest',
+                method: self.__mdMethod || 'GET'
+              });
+              if (isDataUrl(finalUrl, ct)) { MD.pushPayload(finalUrl, self.responseText || '', ct); }
+            } catch (e) {}
+          });
+        } catch (e) {}
+        return originSend.apply(this, arguments);
+      };
+    } catch (e) {}
+
+    // 4) URL.createObjectURL：页面把视频抓成 Blob 再喂给 <video> 时，
+    //    真实地址只存在于网络层；这里至少记下「确实有媒体被合成」
+    try {
+      var originCreate = URL.createObjectURL;
+      if (typeof originCreate === 'function') {
+        URL.createObjectURL = function (obj) {
+          try {
+            NET.blobs += 1;
+            if (typeof Blob !== 'undefined' && obj instanceof Blob) {
+              var type = String(obj.type || '');
+              if (/^(video|audio)\\//.test(type)) {
+                NET.mediaBlobBytes = (NET.mediaBlobBytes || 0) + (obj.size || 0);
+              }
+            }
+          } catch (e) {}
+          return originCreate.apply(URL, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // 5) MSE：页面用 MediaSource 播放时，视频是脚本合成的内存流，没有直链。
+    //    记下 codec 与数据量，供 RN 侧给出准确提示。
+    try {
+      if (window.MediaSource && MediaSource.prototype.addSourceBuffer) {
+        var originAdd = MediaSource.prototype.addSourceBuffer;
+        MediaSource.prototype.addSourceBuffer = function (mime) {
+          try {
+            NET.mse += 1;
+            var m = String(mime || '');
+            if (m && NET.mseMimes.indexOf(m) < 0) { NET.mseMimes.push(m); }
+          } catch (e) {}
+          return originAdd.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+    try {
+      if (window.SourceBuffer && SourceBuffer.prototype.appendBuffer) {
+        var originAppend = SourceBuffer.prototype.appendBuffer;
+        SourceBuffer.prototype.appendBuffer = function (data) {
+          try {
+            if (data && data.byteLength) { NET.appendBytes = (NET.appendBytes || 0) + data.byteLength; }
+          } catch (e) {}
+          return originAppend.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // 6) <video>/<audio> 的 src 由 JS 动态赋值时，DOM 快照里可能已经没有地址了
+    try {
+      var MEP = HTMLMediaElement.prototype;
+      var srcDesc = Object.getOwnPropertyDescriptor(MEP, 'src');
+      if (srcDesc && srcDesc.set) {
+        Object.defineProperty(MEP, 'src', {
+          configurable: true,
+          get: function () { return srcDesc.get ? srcDesc.get.call(this) : ''; },
+          set: function (v) {
+            try {
+              var tag = this.tagName ? String(this.tagName).toLowerCase() : 'media';
+              MD.netPush(v, { initiator: tag === 'audio' ? 'audio' : 'video' });
+            } catch (e) {}
+            return srcDesc.set.call(this, v);
+          }
+        });
+      }
+      var originSetAttr = MEP.setAttribute;
+      MEP.setAttribute = function (name, value) {
+        try {
+          if (name === 'src' && value) {
+            var tagName = this.tagName ? String(this.tagName).toLowerCase() : 'media';
+            MD.netPush(value, { initiator: tagName === 'audio' ? 'audio' : 'video' });
+          }
+        } catch (e) {}
+        return originSetAttr.apply(this, arguments);
+      };
+      // srcObject：WebRTC / MediaStream 直播，没有可下载文件
+      var soDesc = Object.getOwnPropertyDescriptor(MEP, 'srcObject');
+      if (soDesc && soDesc.set) {
+        Object.defineProperty(MEP, 'srcObject', {
+          configurable: true,
+          get: function () { return soDesc.get ? soDesc.get.call(this) : null; },
+          set: function (v) {
+            try { if (v) { NET.streams += 1; } } catch (e) {}
+            return soDesc.set.call(this, v);
+          }
+        });
+      }
+    } catch (e) {}
+  };
+
+  // 尽早启动：覆盖页面加载初期的媒体请求
+  MD.startNet();
+
+  return true;
+})();`;
+
+// ============================================================
+// 片段三：采集与回传
+// ============================================================
+
+const COLLECT_SNIPPET = `(function () {
+  var MD = window.__MD__;
+  if (!MD) { return; }
+  var RE = MD.RE;
+  var NET = MD.net;
+  var abs = MD.abs;
+  var text = MD.text;
+  var attrFrom = MD.attrFrom;
+  var LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url', 'data-echo', 'data-image', 'data-href', 'data-fallback-src', 'data-video-src', 'data-mp4'];
+
+  function metaContent(selector) {
+    try {
+      var node = document.querySelector(selector);
+      return node ? abs(node.getAttribute('content') || '') : '';
+    } catch (e) { return ''; }
+  }
+
   MD.collect = function () {
     var out = {
       title: document.title || '',
       pageUrl: location.href,
       cookie: '',
-      mse: MD.net.mse > 0,
+      /** 页面通过 MSE 播放（blob: 源） */
+      mse: NET.mse > 0,
+      mseMimes: NET.mseMimes || [],
+      /** 使用 blob: 源、拿不到直链的视频数量 */
       blobVideos: 0,
+      /** srcObject（MediaStream）视频数量 */
+      streamVideos: NET.streams || 0,
+      /** 网络层捕获到的媒体请求数 */
+      networkCount: NET.entries ? NET.entries.length : 0,
       images: [],
       videos: [],
     };
@@ -480,14 +798,15 @@ const BASE_SETUP_SCRIPT = `(function () {
     var addImage = adder.addImage;
     var addVideo = adder.addVideo;
 
-    // 1. <img>
-    var imgs = document.querySelectorAll('img');
+    // ---------- 图片 ----------
+    var imgs = MD.queryAll('img');
     for (var i = 0; i < imgs.length; i++) {
       var el = imgs[i];
-      var raw = el.currentSrc || el.getAttribute('src') || '';
+      var raw = '';
+      try { raw = el.currentSrc || el.getAttribute('src') || ''; } catch (e) {}
       if (!raw) {
         var ss = el.getAttribute('srcset') || el.getAttribute('data-srcset');
-        if (ss) { raw = bestSrcset(ss); }
+        if (ss) { raw = MD.bestSrcset(ss); }
       }
       if (!raw) { raw = attrFrom(el, LAZY_ATTRS); }
       if (!raw) { continue; }
@@ -495,39 +814,36 @@ const BASE_SETUP_SCRIPT = `(function () {
         url: raw,
         w: el.naturalWidth || 0,
         h: el.naturalHeight || 0,
-        title: nearbyTitle(el),
+        title: MD.nearbyTitle(el),
         source: 'img'
       });
     }
 
-    // 2. <picture><source srcset>
-    var sources = document.querySelectorAll('picture source[srcset]');
+    var sources = MD.queryAll('picture source[srcset]');
     for (var s = 0; s < sources.length; s++) {
       addImage({
-        url: bestSrcset(sources[s].getAttribute('srcset')),
+        url: MD.bestSrcset(sources[s].getAttribute('srcset')),
         w: 0,
         h: 0,
-        title: nearbyTitle(sources[s].parentElement || sources[s]),
+        title: MD.nearbyTitle(sources[s].parentElement || sources[s]),
         source: 'picture'
       });
     }
 
-    // 3. <a href> 指向图片
-    var links = document.querySelectorAll('a[href]');
+    var links = MD.queryAll('a[href]');
     for (var l = 0; l < links.length; l++) {
       var href = links[l].getAttribute('href') || '';
-      if (!href || href.indexOf('#') === 0) { continue; }
+      if (!href || href.charAt(0) === '#') { continue; }
       var full = abs(href);
       if (!full) { continue; }
-      if (IMG_EXT.test(full)) {
+      if (RE.imageExt.test(full)) {
         addImage({ url: full, w: 0, h: 0, title: text(links[l]).slice(0, 120), source: 'link' });
-      } else if (VID_EXT.test(full)) {
+      } else if (RE.videoExt.test(full) || RE.audioExt.test(full)) {
         addVideo({ url: full, w: 0, h: 0, title: text(links[l]).slice(0, 120), source: 'link' });
       }
     }
 
-    // 4. 背景图
-    var nodes = document.querySelectorAll('*');
+    var nodes = MD.queryAll('*');
     var cap = Math.min(nodes.length, 4000);
     for (var n = 0; n < cap; n++) {
       var node = nodes[n];
@@ -550,49 +866,81 @@ const BASE_SETUP_SCRIPT = `(function () {
       });
     }
 
-    // 5. <video> 与其 <source>
-    var vids = document.querySelectorAll('video');
+    // ---------- 视频：① DOM ----------
+    var vids = MD.queryAll('video');
     for (var vi = 0; vi < vids.length; vi++) {
       var vEl = vids[vi];
-      var vRaw = vEl.currentSrc || vEl.getAttribute('src') || '';
-      if (!vRaw) {
-        var vs = vEl.querySelectorAll('source');
-        for (var k = 0; k < vs.length; k++) {
-          var cand = vs[k].getAttribute('src') || vs[k].getAttribute('data-src') || '';
-          if (cand) { vRaw = cand; break; }
-        }
+      var meta = { w: 0, h: 0, duration: undefined, poster: '', title: '' };
+      try {
+        meta.w = vEl.videoWidth || 0;
+        meta.h = vEl.videoHeight || 0;
+        if (vEl.duration && isFinite(vEl.duration) && vEl.duration > 0) { meta.duration = vEl.duration; }
+        meta.poster = abs(vEl.getAttribute('poster') || '');
+        meta.title = MD.nearbyTitle(vEl);
+      } catch (e) {}
+
+      var srcs = [];
+      var cur = '';
+      try { cur = vEl.currentSrc || vEl.getAttribute('src') || ''; } catch (e) {}
+      if (cur) { srcs.push(cur); }
+      var vs = [];
+      try { vs = vEl.querySelectorAll('source'); } catch (e) {}
+      for (var k = 0; k < vs.length; k++) {
+        var cand = vs[k].getAttribute('src') || vs[k].getAttribute('data-src') || '';
+        if (cand) { srcs.push(cand); }
       }
-      if (!vRaw) { vRaw = attrFrom(vEl, LAZY_ATTRS); }
-      if (!vRaw) { continue; }
-      if (vRaw.indexOf('blob:') === 0) {
-        // 脚本实时合成的内存流，没有直链；真实地址通常能在网络层记录里找到
-        out.blobVideos += 1;
-        continue;
+      var lazy = attrFrom(vEl, LAZY_ATTRS);
+      if (lazy) { srcs.push(lazy); }
+
+      var added = 0;
+      for (var si = 0; si < srcs.length; si++) {
+        var srcRaw = srcs[si];
+        if (!srcRaw) { continue; }
+        if (srcRaw.indexOf('blob:') === 0) { out.blobVideos += 1; continue; }
+        if (srcRaw.indexOf('data:') === 0) { continue; }
+        addVideo({
+          url: srcRaw,
+          poster: meta.poster || undefined,
+          // 分辨率 / 时长只属于真正在播的那一条，<source> 候选不继承
+          w: si === 0 ? meta.w : 0,
+          h: si === 0 ? meta.h : 0,
+          duration: si === 0 ? meta.duration : undefined,
+          title: meta.title,
+          source: si === 0 ? 'video' : 'source',
+          initiator: 'video'
+        });
+        added += 1;
       }
-      addVideo({
-        url: vRaw,
-        poster: abs(vEl.getAttribute('poster') || '') || undefined,
-        w: vEl.videoWidth || 0,
-        h: vEl.videoHeight || 0,
-        duration: vEl.duration && isFinite(vEl.duration) && vEl.duration > 0 ? vEl.duration : undefined,
-        title: nearbyTitle(vEl),
-        source: 'video'
-      });
     }
 
-    // 6. <video>/<audio> 之外独立出现的 <source>
-    var mediaSources = document.querySelectorAll('source[src]');
+    // <video>/<audio> 之外独立出现的 <source>
+    var mediaSources = MD.queryAll('source[src]');
     for (var ms = 0; ms < mediaSources.length; ms++) {
-      var srcVal = mediaSources[ms].getAttribute('src') || '';
+      var msEl = mediaSources[ms];
+      // 挂在 <video>/<audio> 下的 <source> 上一轮已经处理过，避免重复计数
+      var parentTag = msEl.parentNode && msEl.parentNode.tagName ? String(msEl.parentNode.tagName).toLowerCase() : '';
+      if (parentTag === 'video' || parentTag === 'audio') { continue; }
+      var srcVal = msEl.getAttribute('src') || '';
       if (!srcVal) { continue; }
       if (srcVal.indexOf('blob:') === 0) { out.blobVideos += 1; continue; }
-      if (VID_EXT.test(srcVal)) {
+      if (RE.videoExt.test(srcVal) || RE.audioExt.test(srcVal)) {
         addVideo({ url: srcVal, w: 0, h: 0, title: '', source: 'source' });
       }
     }
 
-    // 7. 结构化数据（JSON-LD）
-    var ldNodes = document.querySelectorAll('script[type="application/ld+json"]');
+    // <embed> / <object>：老播放器与部分视频墙仍在用
+    var embeds = MD.queryAll('embed[src], object[data]');
+    for (var em = 0; em < embeds.length; em++) {
+      var eEl = embeds[em];
+      var eSrc = eEl.getAttribute('src') || eEl.getAttribute('data') || '';
+      if (!eSrc) { continue; }
+      if (RE.videoExt.test(eSrc) || RE.audioExt.test(eSrc)) {
+        addVideo({ url: eSrc, w: 0, h: 0, title: eEl.getAttribute('title') || '', source: 'embed' });
+      }
+    }
+
+    // ---------- 视频：② 结构化数据 ----------
+    var ldNodes = MD.queryAll('script[type="application/ld+json"]');
     for (var j = 0; j < ldNodes.length; j++) {
       var data = null;
       try { data = JSON.parse(ldNodes[j].textContent || ''); } catch (e) { data = null; }
@@ -601,46 +949,44 @@ const BASE_SETUP_SCRIPT = `(function () {
       var guardCount = 0;
       while (stack.length && guardCount < 200) {
         guardCount++;
-        var cur = stack.pop();
-        if (!cur || typeof cur !== 'object') { continue; }
-        if (Array.isArray(cur)) {
-          for (var a = 0; a < cur.length; a++) { stack.push(cur[a]); }
+        var curNode = stack.pop();
+        if (!curNode || typeof curNode !== 'object') { continue; }
+        if (Object.prototype.toString.call(curNode) === '[object Array]') {
+          for (var a = 0; a < curNode.length; a++) { stack.push(curNode[a]); }
           continue;
         }
-        var type = cur['@type'] || '';
-        var types = Array.isArray(type) ? type.join(',') : String(type);
-        if (/VideoObject/i.test(types) && cur.contentUrl) {
+        var type = curNode['@type'] || '';
+        var types = Object.prototype.toString.call(type) === '[object Array]' ? type.join(',') : String(type);
+        if (/VideoObject/i.test(types) && curNode.contentUrl) {
           addVideo({
-            url: cur.contentUrl,
-            poster: cur.thumbnailUrl ? (Array.isArray(cur.thumbnailUrl) ? cur.thumbnailUrl[0] : cur.thumbnailUrl) : undefined,
-            w: cur.width || 0,
-            h: cur.height || 0,
-            duration: isoDuration(cur.duration),
-            title: (cur.name || cur.headline || '').slice(0, 120),
+            url: curNode.contentUrl,
+            poster: curNode.thumbnailUrl
+              ? (Object.prototype.toString.call(curNode.thumbnailUrl) === '[object Array]' ? curNode.thumbnailUrl[0] : curNode.thumbnailUrl)
+              : undefined,
+            w: curNode.width || 0,
+            h: curNode.height || 0,
+            duration: MD.isoDuration(curNode.duration),
+            title: String(curNode.name || curNode.headline || '').slice(0, 120),
             source: 'ld+json'
           });
-        } else if (/ImageObject/i.test(types) && cur.contentUrl) {
+        } else if (/ImageObject/i.test(types) && curNode.contentUrl) {
           addImage({
-            url: cur.contentUrl,
-            w: cur.width || 0,
-            h: cur.height || 0,
-            title: (cur.name || cur.caption || '').slice(0, 120),
+            url: curNode.contentUrl,
+            w: curNode.width || 0,
+            h: curNode.height || 0,
+            title: String(curNode.name || curNode.caption || '').slice(0, 120),
             source: 'ld+json'
           });
         }
-        for (var key in cur) {
-          if (Object.prototype.hasOwnProperty.call(cur, key) && typeof cur[key] === 'object') {
-            stack.push(cur[key]);
+        for (var key in curNode) {
+          if (Object.prototype.hasOwnProperty.call(curNode, key) && typeof curNode[key] === 'object') {
+            stack.push(curNode[key]);
           }
         }
       }
     }
 
-    // 8. OpenGraph / meta
-    function metaContent(selector) {
-      var node = document.querySelector(selector);
-      return node ? abs(node.getAttribute('content') || '') : '';
-    }
+    // OpenGraph / Twitter Card
     var ogImage = metaContent('meta[property="og:image"]') || metaContent('meta[name="twitter:image"]');
     if (ogImage) {
       addImage({ url: ogImage, w: 0, h: 0, title: out.title, source: 'meta' });
@@ -648,64 +994,55 @@ const BASE_SETUP_SCRIPT = `(function () {
     // og:video 经常指向站点的「外链播放器页面」（如 B 站的 player.bilibili.com/player.html），
     // 那是一个 HTML 页面而不是媒体文件，收录进来只会得到一条永远放不出的条目。
     var ogVideoType = (function () {
-      var node = document.querySelector('meta[property="og:video:type"]');
-      return node ? String(node.getAttribute('content') || '').toLowerCase() : '';
+      try {
+        var node = document.querySelector('meta[property="og:video:type"]');
+        return node ? String(node.getAttribute('content') || '').toLowerCase() : '';
+      } catch (e) { return ''; }
     })();
-    var ogVideo = metaContent('meta[property="og:video"]') || metaContent('meta[property="og:video:url"]');
-    var ogVideoIsPage = !ogVideo || ogVideoType.indexOf('text/html') === 0 || /\\.html?(\\?|#|$)/i.test(ogVideo);
+    var ogVideo = metaContent('meta[property="og:video"]')
+      || metaContent('meta[property="og:video:url"]')
+      || metaContent('meta[property="og:video:secure_url"]')
+      || metaContent('meta[name="twitter:player:stream"]');
+    var ogVideoIsPage = !ogVideo
+      || ogVideoType.indexOf('text/html') === 0
+      || /\\.html?(\\?|#|$)/i.test(ogVideo);
     if (ogVideo && !ogVideoIsPage) {
       addVideo({ url: ogVideo, w: 0, h: 0, title: out.title, source: 'meta' });
     }
 
-    // 9. 网络层捕获到的媒体请求（HLS 清单、XHR/fetch 拉取的 mp4 等）
-    var netList = MD.net ? MD.net.entries : [];
-    var isManifest = function (u) { return /\\.(m3u8|m3u|mpd)(\\?|#|$)/i.test(u); };
-    var plainOf = function (u) { return u.split('?')[0].split('#')[0]; };
-    var dirOf = function (u) {
-      var s = plainOf(u);
-      var i = s.lastIndexOf('/');
-      return i > -1 ? s.slice(0, i) : s;
-    };
-    var extOf = function (u) {
-      var m = /\\.([a-zA-Z0-9]{2,5})$/.exec(plainOf(u));
-      return m ? m[1].toLowerCase() : '';
-    };
-    // 分片特征：同目录下 3 个以上「同前缀 + 递增编号」的同扩展名资源（seg1/seg2/seg3…）
-    var seqInfo = function (u) {
-      var base = (plainOf(u).split('/').pop() || '').replace(/\\.[a-zA-Z0-9]{2,5}$/, '');
-      var m = /^(.*?)([0-9]{1,6})$/.exec(base);
-      return m ? dirOf(u) + '|' + extOf(u) + '|' + m[1] : null;
-    };
-    var groups = {};
-    for (var gi = 0; gi < netList.length; gi++) {
-      var gKey = seqInfo(netList[gi].url);
-      if (gKey) groups[gKey] = (groups[gKey] || 0) + 1;
-    }
-    var isSegment = function (u) {
-      var key = seqInfo(u);
-      return !!key && (groups[key] || 0) >= 3;
-    };
-    for (var nq = 0; nq < netList.length; nq++) {
-      var ne = netList[nq];
-      // 清单永远保留，只有分片才会被丢弃
-      if (!isManifest(ne.url) && isSegment(ne.url)) continue;
-      addVideo({
-        url: ne.url,
-        w: 0,
-        h: 0,
-        size: ne.size || 0,
-        title: '',
-        source: 'network',
-        viaNetwork: true,
-      });
+    // <link rel="preload" as="video">：站点提前声明的播放地址
+    var preloads = MD.queryAll('link[rel="preload"][href]');
+    for (var pl = 0; pl < preloads.length; pl++) {
+      var as = String(preloads[pl].getAttribute('as') || '').toLowerCase();
+      if (as !== 'video' && as !== 'audio') { continue; }
+      var pHref = abs(preloads[pl].getAttribute('href') || '');
+      if (!pHref) { continue; }
+      addVideo({ url: pHref, w: 0, h: 0, title: '', source: 'preload' });
     }
 
-    // 10) 数据接口响应体（HLS 清单文本 / JSON 里的直链）与页面内嵌初始化数据。
-    //     与 FetchV 的 CHECK_TEXT_CONTENT 思路一致：直链往往藏在接口 JSON 或页面
-    //     内嵌的 __playinfo__ / __INITIAL_STATE__ 等数据里，仅记录请求 URL 抓不到。
-    var VIDEO_KEY_HINT = /(masterUrl|backupUrl|baseUrl|playUrl|play_url|playAddr|play_addr|url_list|videoUrl|video_url|srcUrl|downloadUrl|streamUrl|mediaUrl|originVideoKey|playlink)/i;
-    var IMG_EXT_RE = /\\.(jpe?g|png|gif|webp|bmp|avif|svg|ico)([?#]|$)/i;
-    var MEDIA_HOST_RE = /(\\/video\\/|\\/play\\/|\\/stream\\/|\\/upos|bilivideo|douyinvod|aweme|amemv|snssdk|xhscdn|snap)/i;
+    // ---------- 视频：③ 数据层（接口 JSON / 页面内嵌 STATE） ----------
+    var IMG_EXT_RE = RE.imageExt;
+    var scanBudget = 8000;
+
+    /**
+     * 判定一个字符串值是否像视频地址。
+     * - URL 自带媒体扩展名 / 类型参数 → 直接采信；
+     * - 键名语义强（playUrl / url_list / masterUrl …）→ 采信；
+     * - 键名语义弱（url / link …）→ 需要 URL 另有 CDN 域名或路径特征才采信。
+     */
+    function isVideoish(u, key) {
+      if (!u || u.indexOf('http') !== 0) { return false; }
+      if (MD.isJunk(u)) { return false; }
+      if (IMG_EXT_RE.test(u) || RE.staticExt.test(u)) { return false; }
+      if (RE.videoExt.test(u) || RE.audioExt.test(u)) { return true; }
+      if (RE.mimeHint.test(u)) { return true; }
+      if (RE.videoKeyStrong.test(key || '')) { return true; }
+      if (RE.videoKeyWeak.test(key || '')) {
+        return RE.mediaHost.test(MD.hostOf(u)) || RE.pathEvidence.test(u);
+      }
+      return false;
+    }
+
     var toDim = function (v) {
       if (typeof v === 'number' && isFinite(v)) { return Math.round(v); }
       if (typeof v === 'string') {
@@ -714,47 +1051,56 @@ const BASE_SETUP_SCRIPT = `(function () {
       }
       return 0;
     };
-    /**
-     * 从 JSON 对象里提取宽高（常见字段：width/height、w/h、videoWidth/…），
-     * 站点接口的播放地址旁往往带这几个字段，比事后探测更可靠。
-     */
     var dimOf = function (o) {
-      if (!o || typeof o !== 'object' || Array.isArray(o)) { return null; }
-      var W_KEYS = ['width', 'w', 'videoWidth', 'video_width', 'awemeWidth', 'img_width', 'res_w'];
-      var H_KEYS = ['height', 'h', 'videoHeight', 'video_height', 'awemeHeight', 'img_height', 'res_h'];
+      if (!o || typeof o !== 'object' || Object.prototype.toString.call(o) === '[object Array]') { return null; }
+      var W = ['width', 'w', 'videoWidth', 'video_width', 'awemeWidth', 'img_width', 'res_w'];
+      var H = ['height', 'h', 'videoHeight', 'video_height', 'awemeHeight', 'img_height', 'res_h'];
       var w = 0, h = 0, i, v;
-      for (i = 0; i < W_KEYS.length; i++) {
-        v = toDim(o[W_KEYS[i]]);
+      for (i = 0; i < W.length; i++) {
+        v = toDim(o[W[i]]);
         if (v > 0 && v < 20000) { w = v; break; }
       }
-      for (i = 0; i < H_KEYS.length; i++) {
-        v = toDim(o[H_KEYS[i]]);
+      for (i = 0; i < H.length; i++) {
+        v = toDim(o[H[i]]);
         if (v > 0 && v < 20000) { h = v; break; }
       }
       return w && h ? { w: w, h: h } : null;
     };
-    var isVideoish = function (u, key) {
-      if (!u || u.indexOf('http') !== 0) { return false; }
-      if (SKIP.test(u)) { return false; }
-      if (IMG_EXT_RE.test(u)) { return false; }
-      if (NET_VID_EXT.test(u)) { return true; }
-      if (NET_VID_HINT.test(u)) { return true; }
-      return VIDEO_KEY_HINT.test(key || '') && MEDIA_HOST_RE.test(u);
-    };
-    var scanBudget = 6000;
+
+    /**
+     * 遍历 JSON 树找播放地址。
+     * 数组元素的键名取自「数组所在属性的名字」——抖音的 play_addr.url_list
+     * 就是这种结构，只按元素下标判定会整片漏掉。
+     */
     var scanJson = function (obj) {
       if (!obj || typeof obj !== 'object') { return; }
-      var stack = [{ o: obj, p: null }];
+      var stack = [{ o: obj, p: null, k: '' }];
       var visited = 0;
       var key, val, ai;
       while (stack.length && visited < scanBudget) {
         var item = stack.pop();
         visited++;
         var cur = item.o;
-        var parent = item.p;
         if (!cur || typeof cur !== 'object') { continue; }
-        if (Array.isArray(cur)) {
-          for (ai = 0; ai < cur.length; ai++) { stack.push({ o: cur[ai], p: parent }); }
+        var isArr = Object.prototype.toString.call(cur) === '[object Array]';
+        if (isArr) {
+          for (ai = 0; ai < cur.length; ai++) {
+            if (typeof cur[ai] === 'string' && cur[ai].length > 10) {
+              if (isVideoish(cur[ai], item.k)) {
+                var d = dimOf(item.p);
+                addVideo({
+                  url: cur[ai],
+                  w: d ? d.w : 0,
+                  h: d ? d.h : 0,
+                  size: 0,
+                  title: '',
+                  source: 'json'
+                });
+              }
+            } else if (cur[ai] && typeof cur[ai] === 'object') {
+              stack.push({ o: cur[ai], p: item.p, k: '' });
+            }
+          }
           continue;
         }
         for (key in cur) {
@@ -762,8 +1108,7 @@ const BASE_SETUP_SCRIPT = `(function () {
           val = cur[key];
           if (typeof val === 'string' && val.length > 10) {
             if (isVideoish(val, key)) {
-              // 播放地址旁的 width/height（或其父对象）是比事后探测更准的来源
-              var dim = dimOf(cur) || dimOf(parent);
+              var dim = dimOf(cur) || dimOf(item.p);
               addVideo({
                 url: val,
                 w: dim ? dim.w : 0,
@@ -774,20 +1119,22 @@ const BASE_SETUP_SCRIPT = `(function () {
               });
             }
           } else if (val && typeof val === 'object') {
-            stack.push({ o: val, p: cur });
+            stack.push({ o: val, p: cur, k: Object.prototype.toString.call(val) === '[object Array]' ? key : '' });
           }
         }
       }
     };
-    var pl;
-    for (var pi = 0; pi < MD.payloads.length; pi++) {
-      pl = MD.payloads[pi];
-      if (pl.type === 'manifest') {
-        addVideo({ url: pl.url, w: 0, h: 0, size: 0, title: '', source: 'json' });
-      } else if (pl.type === 'json' && pl.json) {
-        scanJson(pl.json);
+
+    var pi;
+    for (pi = 0; pi < NET.payloads.length; pi++) {
+      var pl2 = NET.payloads[pi];
+      if (pl2.type === 'manifest') {
+        addVideo({ url: pl2.url, w: 0, h: 0, size: 0, title: '', source: 'json' });
+      } else if (pl2.type === 'json' && pl2.json) {
+        scanJson(pl2.json);
       }
     }
+
     var extractBalanced = function (str, start) {
       var depth = 0, inStr = false, esc = false, i = start;
       for (; i < str.length; i++) {
@@ -804,28 +1151,29 @@ const BASE_SETUP_SCRIPT = `(function () {
       }
       return '';
     };
+
     var scanInlineScripts = function () {
       var scripts;
       try { scripts = document.querySelectorAll('script'); } catch (e) { return; }
-      var SCAN_LIMIT = 8;
+      var SCAN_LIMIT = 10;
       var scanned = 0;
-      for (var si = 0; si < scripts.length && scanned < SCAN_LIMIT; si++) {
-        var node = scripts[si];
+      for (var si2 = 0; si2 < scripts.length && scanned < SCAN_LIMIT; si2++) {
+        var node = scripts[si2];
         if (node.src) { continue; }
-        var text = node.textContent || '';
-        if (!text || text.length > 4000000) { continue; }
+        var body = node.textContent || '';
+        if (!body || body.length > 4000000) { continue; }
         var nodeType = String(node.type || '').toLowerCase();
         if (nodeType === 'application/json') {
-          try { scanJson(JSON.parse(text)); scanned++; } catch (e) {}
+          try { scanJson(JSON.parse(body)); scanned++; } catch (e) {}
           continue;
         }
         if (nodeType && nodeType !== 'text/javascript' && nodeType !== 'module' && nodeType !== 'application/javascript') { continue; }
         var re = /window\\.([A-Za-z_$][\\w$]*)\\s*=\\s*(\\{)/g;
         var m;
-        while ((m = re.exec(text)) !== null) {
+        while ((m = re.exec(body)) !== null) {
           var keyName = m[1];
-          if (!/(INIT|playinfo|NEXT|NUXT|SSR|DATA|STATE|PLAYINFO)/i.test(keyName)) { continue; }
-          var jsonText = extractBalanced(text, m.index + m[0].length - 1);
+          if (!/(INIT|playinfo|NEXT|NUXT|SSR|DATA|STATE|PLAYINFO|VIDEO|CONFIG)/i.test(keyName)) { continue; }
+          var jsonText = extractBalanced(body, m.index + m[0].length - 1);
           if (!jsonText || jsonText.length > 2000000) { continue; }
           try { scanJson(JSON.parse(jsonText)); } catch (e) {}
           scanned++;
@@ -835,40 +1183,66 @@ const BASE_SETUP_SCRIPT = `(function () {
     };
     scanInlineScripts();
 
-    return out;
-  };
+    // ---------- 视频：④ 网络层 ----------
+    var netList = NET.entries || [];
+    var plainOf = function (u) { return u.split('#')[0].split('?')[0]; };
+    var dirOf = function (u) {
+      var s = plainOf(u);
+      var i2 = s.lastIndexOf('/');
+      return i2 > -1 ? s.slice(0, i2) : s;
+    };
+    var extOf = function (u) {
+      var m = /\\.([a-zA-Z0-9]{2,5})$/.exec(plainOf(u));
+      return m ? m[1].toLowerCase() : '';
+    };
+    var isManifest = function (u) { return /^(m3u8|m3u|mpd)$/.test(extOf(u)); };
 
-  /**
-   * 站点专属采集：抖音这类站点要补的接口数据在 DOM 上不存在，需要额外请求。
-   * 站点钩子可以改写 out.images / out.videos（例如丢掉站点自己的占位素材），
-   * 因此放在通用采集之后执行。
-   *
-   * 钩子可以是同步的，也可以返回 Promise——抖音就是异步的（要现请求详情接口）。
-   * 单个站点抛错不影响其它站点，也不影响已经采到的通用结果。
-   */
-  MD.runSites = function (out) {
-    var api = MD.adderFor(out);
-    var sites = [];
-    var pool = MD.sites || [];
-    var i;
-    for (i = 0; i < pool.length; i++) {
-      var site = pool[i];
-      if (!site || !site.collect) { continue; }
-      var matched = false;
-      try { matched = site.match(MD.pageHref()); } catch (e) { matched = false; }
-      if (matched) { sites.push(site); }
+    // 清单所在目录：该目录下的 ts/m4s 一定是它的分片
+    var manifestDirs = {};
+    var gi;
+    for (gi = 0; gi < netList.length; gi++) {
+      if (isManifest(netList[gi].url)) { manifestDirs[dirOf(netList[gi].url)] = true; }
     }
-    var index = 0;
-    function next() {
-      if (index >= sites.length) { return Promise.resolve(out); }
-      var current = sites[index++];
-      try {
-        return Promise.resolve(current.collect(out, api)).then(next, next);
-      } catch (e) {
-        return next();
-      }
+    // 分片特征：同目录 + 同扩展名 + 同前缀 + 递增编号（seg1/seg2/seg3…）
+    var seqKey = function (u) {
+      var ext = extOf(u);
+      if (!RE.segmentExt.test('.' + ext)) { return null; }
+      var base = (plainOf(u).split('/').pop() || '').replace(/\\.[a-zA-Z0-9]{2,5}$/, '');
+      var m = /^(.*?)([0-9]{1,7})$/.exec(base);
+      return m ? dirOf(u) + '|' + ext + '|' + m[1] : null;
+    };
+    var groups = {};
+    for (gi = 0; gi < netList.length; gi++) {
+      var gKey = seqKey(netList[gi].url);
+      if (gKey) { groups[gKey] = (groups[gKey] || 0) + 1; }
     }
-    return next();
+    var isSegment = function (u) {
+      var ext = extOf(u);
+      var k = seqKey(u);
+      var count = k ? (groups[k] || 0) : 0;
+      // 目录下已有清单：出现两次就足以认定是分片
+      if (manifestDirs[dirOf(u)] && /^(ts|m4s|mp4|m4a|aac|webm)$/.test(ext)) { return count >= 2; }
+      return count >= 3;
+    };
+
+    for (gi = 0; gi < netList.length; gi++) {
+      var ne = netList[gi];
+      // 清单永远保留，只有分片会被丢弃
+      if (!isManifest(ne.url) && isSegment(ne.url)) { continue; }
+      addVideo({
+        url: ne.url,
+        w: 0,
+        h: 0,
+        size: ne.size || 0,
+        title: '',
+        source: 'network',
+        viaNetwork: true,
+        contentType: ne.contentType || '',
+        initiator: ne.initiator || ''
+      });
+    }
+
+    return out;
   };
 
   /** 对缺失的宽高/时长做二次探测（带整体超时兜底） */
@@ -918,8 +1292,6 @@ const BASE_SETUP_SCRIPT = `(function () {
     try {
       MD.autoScroll(2500)
         .then(function () { return MD.collect(); })
-        // 站点钩子可能要现请求接口（抖音的详情接口就是），必须等它完成再回传
-        .then(function (res) { return MD.runSites(res); })
         .then(function (res) { return MD.enrich(res); })
         .then(function (res) { send({ __md: 'result', payload: res }); })
         .catch(function (err) { send({ __md: 'error', message: String((err && err.message) || err) }); });
@@ -932,28 +1304,13 @@ const BASE_SETUP_SCRIPT = `(function () {
 })();`;
 
 /**
- * 通用脚本 + 各站点的页面采集脚本。
- * 站点脚本依赖通用脚本挂好的 window.__MD__，必须排在后面。
- */
-export const SETUP_SCRIPT = SITE_PAGE_SCRIPTS
-  ? `${BASE_SETUP_SCRIPT}\n${SITE_PAGE_SCRIPTS}`
-  : BASE_SETUP_SCRIPT;
-
-/**
- * 生成注入脚本，并记录用户输入的原始地址。
+ * 完整注入脚本。
  *
- * 必须先于 SETUP_SCRIPT 写入 __MD_TASK_URL__：站点脚本在注册时就要用它判断归属。
- * 页面一旦跳转到风控页/首页，location 就不再是用户想抓的页面，只有原始地址可信。
+ * 顺序有讲究：NET 必须在 SHARED 之后（依赖它挂好的 window.__MD__ 与规则），
+ * 又必须尽量早执行（要覆盖页面加载初期的媒体请求），因此夹在中间。
  */
-export function buildSetupScript(taskUrl: string): string {
-  let literal = '""';
-  try {
-    literal = JSON.stringify(taskUrl || '');
-  } catch {
-    literal = '""';
-  }
-  return `window.__MD_TASK_URL__ = ${literal};\n${SETUP_SCRIPT}`;
-}
+export const SETUP_SCRIPT =
+  `${SHARED_SNIPPET}\n${NET_SNIPPET}\n${COLLECT_SNIPPET}`;
 
 /** 触发采集（页面加载完成或超时兜底后调用） */
 export const EXTRACT_SCRIPT = `(function(){ if (window.__MD__ && window.__MD__.extract) { window.__MD__.extract(); } return true; })();`;

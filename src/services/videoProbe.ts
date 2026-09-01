@@ -967,7 +967,7 @@ function applyResult(item: MediaItem, result: VideoProbeResult) {
   item.streamKind = result.streamKind;
   item.format = result.format;
   item.contentType = result.contentType;
-  // 站点适配可能已给出备用地址（如 B 站的备源 CDN），探测结果为空时不要覆盖掉
+  // 页面脚本可能已给出备用地址，探测结果为空时不要覆盖掉
   if (result.fallbackUrl) item.fallbackUrl = result.fallbackUrl;
   item.downloadable = result.downloadable;
   item.headers = result.headers;
@@ -990,10 +990,10 @@ interface ProbeVideosOptions extends VideoProbeContext {
  */
 export async function probeVideos(items: MediaItem[], options: ProbeVideosOptions = {}) {
   // 非 http(s) 的地址（blob:/data:）不发起请求，但仍会标记为不可播放。
-  // 超过上限时优先校验页面 DOM 里的直链，网络层嗅探到的候选排在后面。
+  // 顺序直接沿用调用方给出的：scrapeMedia 已按置信度排好序，
+  // 超过上限时截断的就是最不可能是正片的那些，这里不要再重排。
   const targets = items
     .filter(item => item.kind === 'video')
-    .sort((a, b) => (a.viaNetwork ? 1 : 0) - (b.viaNetwork ? 1 : 0))
     .slice(0, TIMING.VIDEO_PROBE_MAX);
 
   if (!targets.length) {

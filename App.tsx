@@ -27,9 +27,9 @@ import VideoCard from './src/components/VideoCard';
 import VideoPlayerModal from './src/components/VideoPlayerModal';
 import { COLORS, GAP, PAGE_PADDING } from './src/constants';
 import { downloadMedia, saveResultText } from './src/services/downloader';
-import { buildMediaItems, filterAndSort } from './src/services/media';
+import { filterAndSort } from './src/services/media';
+import { scrapeMedia } from './src/services/scrape';
 import { probeSizes } from './src/services/sizeProbe';
-import { fetchSiteVideos } from './src/services/sites';
 import { probeVideos } from './src/services/videoProbe';
 import {
   DEFAULT_FILTER,
@@ -165,24 +165,15 @@ export default function App() {
 
   const handleResult = useCallback(
     async (payload: RawScrapePayload) => {
-      const { images: nextImages, videos: genericVideos } = buildMediaItems(payload);
       const pageUrl = payload.pageUrl || taskUrl || undefined;
 
-      // B 站这类站点用 MSE 播放分离音轨的 DASH 流，通用抓取拿不到完整直链。
-      // 命中特殊站点名单时改用站点适配器，未命中（或适配器失败）则沿用通用抓取结果。
-      const siteVideos = pageUrl
-        ? await fetchSiteVideos({ pageUrl, cookie: payload.cookie })
-        : [];
-      const nextVideos = siteVideos.length
-        ? [...siteVideos, ...genericVideos]
-        : genericVideos;
+      // 唯一的抓取入口：页面脚本的候选在这里归一、过滤、去重、排序。
+      const { images: nextImages, videos: nextVideos, hint } = await scrapeMedia(payload);
 
       if (!nextImages.length && !nextVideos.length) {
         setProgress({
           phase: 'error',
-          message: payload.blobVideos
-            ? '页面中的视频由脚本实时合成（MSE/HLS），没有可直接下载的地址'
-            : '未在该页面发现可下载的图片或视频，换一个网址试试',
+          message: hint || '未在该页面发现可下载的图片或视频，换一个网址试试',
         });
         return;
       }

@@ -1,62 +1,11 @@
-import { LIMITS } from '../constants';
-import type { FilterState, MediaItem, RawScrapePayload } from '../types';
-import { fileNameFromUrl } from '../utils/url';
+/**
+ * 列表的筛选与排序。
+ *
+ * 资源的采集与归一化不在这里：统一入口是 services/scrape.ts 的 scrapeMedia，
+ * 它负责把页面脚本的候选整合成 MediaItem。
+ */
 
-function shortTitle(raw: string | undefined, url: string): string {
-  const text = (raw || '').trim();
-  if (text) return text.slice(0, 120);
-  return fileNameFromUrl(url);
-}
-
-export function buildMediaItems(payload: RawScrapePayload): {
-  images: MediaItem[];
-  videos: MediaItem[];
-} {
-  const images: MediaItem[] = [];
-  const videos: MediaItem[] = [];
-  const seen = new Set<string>();
-
-  (payload.images || []).forEach((raw, index) => {
-    if (!raw?.url || seen.has(`i${raw.url}`)) return;
-    seen.add(`i${raw.url}`);
-    images.push({
-      id: `img-${index}`,
-      kind: 'image',
-      url: raw.url,
-      title: shortTitle(raw.title, raw.url),
-      width: raw.w || undefined,
-      height: raw.h || undefined,
-      size: raw.size || undefined,
-      source: raw.source,
-    });
-    if (images.length >= LIMITS.IMAGES) return;
-  });
-
-  (payload.videos || []).forEach((raw, index) => {
-    if (!raw?.url || seen.has(`v${raw.url}`)) return;
-    seen.add(`v${raw.url}`);
-    videos.push({
-      id: `vid-${index}`,
-      kind: 'video',
-      url: raw.url,
-      poster: raw.poster || undefined,
-      title: shortTitle(raw.title, raw.url),
-      width: raw.w || undefined,
-      height: raw.h || undefined,
-      duration: raw.duration || undefined,
-      size: raw.size || undefined,
-      source: raw.source,
-      contentType: raw.contentType || undefined,
-      fallbackUrl: raw.fallbackUrl || undefined,
-      headers: raw.headers || undefined,
-      viaNetwork: raw.viaNetwork,
-      pageProbeOk: raw.probeOk,
-    });
-    if (videos.length >= LIMITS.VIDEOS) return;
-  });
-
-  return { images, videos };
-}
+import type { FilterState, MediaItem } from '../types';
 
 /** 像素总量：图片的「尺寸」、视频的「分辨率」 */
 function pixelArea(item: MediaItem): number {
