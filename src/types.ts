@@ -36,6 +36,14 @@ export interface MediaItem {
   contentType?: string;
   /** 主播放列表解析出的最佳清晰度地址，作为播放失败时的兜底 */
   fallbackUrl?: string;
+  /** 同组 DASH 轨道数量（含音轨与备用码率），>1 表示已合并的多轨资源 */
+  trackCount?: number;
+  /** 独立音轨地址（DASH 伴音轨，合并后收纳，不再单独展示） */
+  audioTrackUrl?: string;
+  /** 全部伴音轨地址（多音轨场景按序兜底，首条与 audioTrackUrl 一致） */
+  audioTrackUrls?: string[];
+  /** 同组其余轨道地址（低码率视频轨等），播放失败时按序兜底 */
+  variantUrls?: string[];
   /** 是否可以直接下载保存（HLS/DASH 需合并分片，暂不支持） */
   downloadable?: boolean;
   /** 下载/播放时需要携带的请求头（Referer、Cookie 等） */
@@ -96,6 +104,17 @@ export interface RawScrapePayload {
   streamVideos?: number;
   /** 网络层捕获到的媒体请求数 */
   networkCount?: number;
+  /** B 站音画分离探测诊断（仅 bilibili 域名有意义） */
+  biliDebug?: {
+    isBili: boolean;
+    hasPlayinfo: boolean;
+    hasInitialState: boolean;
+    hasDash: boolean;
+    videoTracks: number;
+    audioTracks: number;
+    pickedAudio: boolean;
+    error?: string;
+  } | null;
   images: Array<{
     url: string;
     w?: number;
@@ -130,6 +149,12 @@ export interface RawScrapePayload {
     probeOk?: boolean;
     /** 页面脚本给出的置信度（RN 侧会重算，主要用于页面内的探测排序） */
     score?: number;
+    /**
+     * 页面脚本显式标注的伴随音轨地址（DASH 音画分离场景）。
+     * 站点适配层（如 B 站）已明确区分音视频轨时使用，优先级高于通用层
+     * 靠 URL/Content-Type 模糊识别的 looksAudio，避免音频轨被误判为视频轨。
+     */
+    audioTrackUrl?: string;
   }>;
 }
 

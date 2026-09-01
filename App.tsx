@@ -31,6 +31,7 @@ import { filterAndSort } from './src/services/media';
 import { scrapeMedia } from './src/services/scrape';
 import { probeSizes } from './src/services/sizeProbe';
 import { probeVideos } from './src/services/videoProbe';
+import { dedupeProbedVideos } from './src/services/videoRules';
 import {
   DEFAULT_FILTER,
   type DownloadSnapshot,
@@ -160,6 +161,18 @@ export default function App() {
     return filterAndSort(visible, filter);
   }, [tab, images, videos, filter, showUnplayable]);
 
+  // 列表统计数字与列表实际展示一致：应用「隐藏无法播放」与筛选条件后再计数
+  const imageCount = useMemo(
+    () => filterAndSort(images, filter).length,
+    [images, filter],
+  );
+  const videoCount = useMemo(() => {
+    const visible = !showUnplayable
+      ? videos.filter(item => item.playback !== 'unplayable')
+      : videos;
+    return filterAndSort(visible, filter).length;
+  }, [videos, filter, showUnplayable]);
+
   const imageWidth = (screenWidth - PAGE_PADDING * 2 - GAP) / 2;
   const videoWidth = screenWidth - PAGE_PADDING * 2;
 
@@ -168,7 +181,19 @@ export default function App() {
       const pageUrl = payload.pageUrl || taskUrl || undefined;
 
       // 唯一的抓取入口：页面脚本的候选在这里归一、过滤、去重、排序。
-      const { images: nextImages, videos: nextVideos, hint } = await scrapeMedia(payload);
+      let { images: nextImages, videos: nextVideos, hint, stats } = await scrapeMedia(payload);
+
+      // [诊断] B 站音画分离排查：打印 playinfo 是否识别、首条视频是否带音轨与防盗链头
+      console.log('[BILI-DEBUG]', JSON.stringify(stats?.biliDebug || null));
+      console.log('[BILI-DEBUG] first video:', nextVideos[0]
+        ? JSON.stringify({
+            url: nextVideos[0].url?.slice(0, 80),
+            audioTrackUrl: nextVideos[0].audioTrackUrl ? nextVideos[0].audioTrackUrl.slice(0, 80) : null,
+            audioTrackUrls: (nextVideos[0].audioTrackUrls || []).map((u: string) => u.slice(0, 80)),
+            headers: nextVideos[0].headers || null,
+            playback: nextVideos[0].playback,
+          })
+        : 'none');
 
       if (!nextImages.length && !nextVideos.length) {
         setProgress({
@@ -202,7 +227,10 @@ export default function App() {
           onTick: (done, total) =>
             setProbeStatus(total > 0 ? { done, total, label } : null),
         });
-        setVideos([...nextVideos]);
+        // 探测补齐真实分辨率/时长/体积后，按内容去重：
+        // 1) 分辨率+时长+体积一致的重复资源；2) 同源但元数据残缺的 .m4s 轨道。
+        nextVideos = dedupeProbedVideos(nextVideos);
+        setVideos(nextVideos);
       }
 
       // 再补充文件体积（已判定不可播放的视频不再浪费请求）
@@ -419,8 +447,8 @@ export default function App() {
       <View style={styles.resultWrap}>
         <ListHeader
           activeTab={tab}
-          imageCount={images.length}
-          videoCount={videos.length}
+          imageCount={imageCount}
+          videoCount={videoCount}
           onTabChange={setTab}
           selectionMode={selectionMode}
           onToggleSelection={() => {

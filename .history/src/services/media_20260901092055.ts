@@ -33,14 +33,14 @@ export function filterAndSort<T extends MediaItem>(items: T[], filter: FilterSta
 
   // 默认排序：可播放的优先，其次图片按尺寸、视频按分辨率从大到小；尺寸缺失时回退到文件体积。
   // 体积探测完成后会重建数组，此处会自动重排。
-  // if (filter.sortField === 'default') {
-  //   return filtered.sort(
-  //     (a, b) =>
-  //       playableRank(b) - playableRank(a) ||
-  //       pixelArea(b) - pixelArea(a) ||
-  //       (b.size ?? 0) - (a.size ?? 0),
-  //   );
-  // }
+  if (filter.sortField === 'default') {
+    return filtered.sort(
+      (a, b) =>
+        playableRank(b) - playableRank(a) ||
+        pixelArea(b) - pixelArea(a) ||
+        (b.size ?? 0) - (a.size ?? 0),
+    );
+  }
 
   const dir = filter.sortOrder === 'asc' ? 1 : -1;
   const valueOf = (item: MediaItem): number | string => {

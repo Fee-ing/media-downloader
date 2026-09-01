@@ -14,12 +14,17 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { COLORS } from '../constants';
 import type { MediaItem } from '../types';
+import { isAudioTrackLike } from '../services/videoRules';
 import { formatBytes, formatDuration, formatResolution } from '../utils/format';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 
 type PlayerComponent = React.ComponentType<{
   uri: string;
+  /** DASH 伴音轨直链，与 uri 组合播放（仅同组多轨资源）；多音轨时按序兜底 */
+  audioUris?: string[];
+  /** 兼容旧接口：单条伴音轨直链 */
+  audioUri?: string;
   headers?: Record<string, string>;
   contentType?: 'auto' | 'progressive' | 'hls' | 'dash';
   onReady: () => void;
@@ -66,25 +71,54 @@ export default function VideoPlayerModal({
 }: Props) {
   const [ready, setReady] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
-  const [useFallback, setUseFallback] = useState(false);
+  const [chainIndex, setChainIndex] = useState(0);
   const [Player, setPlayer] = useState<PlayerComponent | null>(null);
 
   useEffect(() => {
     if (!visible) return;
     setReady(false);
     setFailed(null);
-    setUseFallback(false);
+    setChainIndex(0);
     setPlayer(() => loadPlayer());
   }, [visible, item?.url]);
 
+  // 播放链：主地址 → 清单解析出的最佳清晰度 → 同组备用轨道，逐个尝试。
+  // 排除音频轨（URL 或 Content-Type 特征），避免播到只有声音没有画面的伴音轨。
+  // 对 DASH 音画分离资源（audioTrackUrl 存在时）：主地址与同组备用视频轨都配对
+  // 伴音轨，由播放器以「双播放器同步」的方式组合出声音；fallbackUrl 来自其它
+  // 候选资源、时长可能不一致，不与其配对。
+  const playChain = useMemo(() => {
+    const chain: Array<{ uri: string; audioUris?: string[] }> = [];
+    // 全部伴音轨（多音轨按序兜底）；兼容仅单个 audioTrackUrl 的旧数据
+    const audioUris =
+      item?.audioTrackUrls && item.audioTrackUrls.length
+        ? item.audioTrackUrls
+        : item?.audioTrackUrl
+          ? [item.audioTrackUrl]
+          : undefined;
+    const grouped = (u: string) => u === item?.url || (item?.variantUrls || []).includes(u);
+    const push = (u?: string) => {
+      if (!u || chain.some(entry => entry.uri === u)) return;
+      if (isAudioTrackLike({ url: u })) return;
+      chain.push({ uri: u, audioUris: grouped(u) ? audioUris : undefined });
+    };
+    push(item?.url);
+    push(item?.fallbackUrl);
+    (item?.variantUrls || []).forEach(push);
+    // 兜底：万一主地址被误判为音轨，仍保留原始地址让播放器自己尝试
+    if (!chain.length && item?.url) chain.push({ uri: item.url, audioUris });
+    return chain;
+  }, [item?.url, item?.fallbackUrl, item?.variantUrls, item?.audioTrackUrl, item?.audioTrackUrls]);
+
   const blocked = item?.playback === 'unplayable';
-  const playUri = useFallback ? item?.fallbackUrl || item?.url : item?.url;
+  const playUri = playChain[Math.min(chainIndex, playChain.length - 1)]?.uri;
+  const pairedAudioUris = playChain[Math.min(chainIndex, playChain.length - 1)]?.audioUris;
 
   const handleError = (message?: string) => {
-    // 主播放列表放不出来时，退回到解析出的最佳清晰度地址再试一次
-    if (!useFallback && item?.fallbackUrl) {
+    // 当前地址放不出来时，退回播放链中的下一个备用地址再试
+    if (chainIndex + 1 < playChain.length) {
       setReady(false);
-      setUseFallback(true);
+      setChainIndex(chainIndex + 1);
       return;
     }
     setFailed(message || item?.playbackNote || '该视频无法播放');
@@ -126,6 +160,7 @@ export default function VideoPlayerModal({
             <Player
               key={playUri}
               uri={playUri}
+              audioUris={pairedAudioUris}
               headers={headers}
               contentType={contentTypeOf(item)}
               onReady={() => setReady(true)}
@@ -158,9 +193,7 @@ export default function VideoPlayerModal({
               <Text style={styles.errorText}>
                 {item.playbackNote || failed}
               </Text>
-              {useFallback ? null : (
-                <Text style={styles.errorHint}>可尝试用系统浏览器打开原网页观看</Text>
-              )}
+              <Text style={styles.errorHint}>可尝试用系统浏览器打开原网页观看</Text>
             </View>
           ) : null}
         </View>
@@ -172,6 +205,9 @@ export default function VideoPlayerModal({
             <Text style={styles.meta}>{formatBytes(item.size)}</Text>
             {item.streamKind === 'hls' ? <Text style={styles.meta}>HLS 流媒体</Text> : null}
             {item.streamKind === 'dash' ? <Text style={styles.meta}>DASH 流媒体</Text> : null}
+            {item.trackCount && item.trackCount > 1 ? (
+              <Text style={styles.meta}>{`DASH 多轨 · ${item.trackCount} 条轨道`}</Text>
+            ) : null}
           </View>
 
           {item.playbackNote && !blocked ? (

@@ -776,6 +776,105 @@ const COLLECT_SNIPPET = `(function () {
     } catch (e) { return ''; }
   }
 
+  /**
+   * 从多个可能的位置取出 B 站 DASH 数据。
+   * 现代 B 站页面把播放信息放在 window.__playinfo__（内联 <script>），部分
+   * 场景也会塞进 window.__INITIAL_STATE__ 的 playinfo 字段。两个都尝试。
+   */
+  MD.findBilibiliDash = function () {
+    try {
+      var sources = [];
+      if (window.__playinfo__) { sources.push(window.__playinfo__); }
+      if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.playinfo) {
+        sources.push(window.__INITIAL_STATE__.playinfo);
+      }
+      for (var s = 0; s < sources.length; s++) {
+        var raw = sources[s];
+        if (raw && raw.data && raw.data.dash && raw.data.dash.video && raw.data.dash.video.length) {
+          return raw.data.dash;
+        }
+      }
+    } catch (e) {}
+    return null;
+  };
+
+  /**
+   * B 站专属适配：解析 DASH 音画分离结构。
+   *
+   * B 站视频是 DASH 格式，video[] 与 audio[] 各自独立：
+   *   data.dash.video[].baseUrl  —— 视频轨（.m4s，无声）
+   *   data.dash.audio[].baseUrl  —— 伴音轨（.m4a/.m4s）
+   * 两者在页面里是分离的地址，通用规则只能捞到视频轨，导致「播放无声 +
+   * 下载只得到无声 m4s」。这里直接读取 playinfo，把每条视频轨与「带宽最高的
+   * 伴音轨」配对，通过 audioTrackUrl 一并带回，下游的合并 / 双轨播放才能生效。
+   *
+   * 只认 bilibili 域名，避免误伤其它站点。返回是否成功拿到数据（供等待循环判断）。
+   */
+  MD.collectBilibiliDash = function (addVideo) {
+    try {
+      if (!/bilibili\.com$/i.test(MD.hostOf(location.href))) { return false; }
+      var dash = MD.findBilibiliDash();
+      if (!dash) { return false; }
+      var videos = dash.video || [];
+      var audios = dash.audio || [];
+      if (!videos.length) { return false; }
+
+      // 选一条音轨：带宽最高（最清晰）的伴音轨；无带宽则取第一条
+      var bestAudio = null;
+      for (var a = 0; a < audios.length; a++) {
+        var au = audios[a];
+        // baseUrl 在 B 站常被置空，真正的可下载地址在 backupUrl[0]
+        var auUrl = au && (au.baseUrl || (au.backupUrl && au.backupUrl[0]) || au.base_url || au.url);
+        if (!auUrl) { continue; }
+        var bw = parseInt(au.bandwidth || au.BandWidth || 0, 10) || 0;
+        if (!bestAudio || bw > (bestAudio._bw || 0)) {
+          bestAudio = { url: auUrl, _bw: bw };
+        }
+      }
+      var audioUrl = bestAudio ? bestAudio.url : '';
+
+      for (var v = 0; v < videos.length; v++) {
+        var vv = videos[v];
+        var vUrl = vv && (vv.baseUrl || (vv.backupUrl && vv.backupUrl[0]) || vv.base_url || vv.url);
+        if (!vUrl) { continue; }
+        addVideo({
+          url: vUrl,
+          w: parseInt(vv.width || 0, 10) || 0,
+          h: parseInt(vv.height || 0, 10) || 0,
+          duration: dash.duration ? parseFloat(dash.duration) : undefined,
+          title: document.title || '',
+          source: 'json',
+          audioTrackUrl: audioUrl || undefined
+        });
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /**
+   * 等待 B 站 playinfo 就绪。B 站播放器是延迟初始化的，window.__playinfo__
+   * 可能在页面 load 完成后才写入并填充 data.dash。若 collect 时直接读取为空，
+   * 就轮询等待一段时间再读，确保能拿到音画分离的轨道地址。
+   */
+  MD.waitForBilibiliDash = function (timeoutMs) {
+    return new Promise(function (resolve) {
+      if (!/bilibili\.com$/i.test(MD.hostOf(location.href))) { resolve(false); return; }
+      if (MD.findBilibiliDash()) { resolve(true); return; }
+      var deadline = Date.now() + (timeoutMs || 6000);
+      var timer = window.setInterval(function () {
+        if (MD.findBilibiliDash()) {
+          try { window.clearInterval(timer); } catch (e) {}
+          resolve(true);
+        } else if (Date.now() > deadline) {
+          try { window.clearInterval(timer); } catch (e) {}
+          resolve(false);
+        }
+      }, 300);
+    });
+  };
+
   MD.collect = function () {
     var out = {
       title: document.title || '',
@@ -792,11 +891,32 @@ const COLLECT_SNIPPET = `(function () {
       networkCount: NET.entries ? NET.entries.length : 0,
       images: [],
       videos: [],
+      /** 调试用：B 站音画分离探测结果（仅 bilibili 域名有意义） */
+      biliDebug: null,
     };
     try { out.cookie = document.cookie || ''; } catch (e) {}
     var adder = MD.adderFor(out);
     var addImage = adder.addImage;
     var addVideo = adder.addVideo;
+
+    // 站点专属适配：B 站 DASH 音画分离，优先把音轨配对进来
+    try {
+      var dash = MD.findBilibiliDash();
+      var biliVideos = dash ? (dash.video || []).length : 0;
+      var biliAudios = dash ? (dash.audio || []).length : 0;
+      out.biliDebug = {
+        isBili: /bilibili\.com$/i.test(MD.hostOf(location.href)),
+        hasPlayinfo: !!window.__playinfo__,
+        hasInitialState: !!(window.__INITIAL_STATE__),
+        hasDash: !!dash,
+        videoTracks: biliVideos,
+        audioTracks: biliAudios,
+        pickedAudio: biliAudios > 0,
+      };
+    } catch (e) {
+      out.biliDebug = { error: String((e && e.message) || e) };
+    }
+    MD.collectBilibiliDash(addVideo);
 
     // ---------- 图片 ----------
     var imgs = MD.queryAll('img');
@@ -1220,6 +1340,8 @@ const COLLECT_SNIPPET = `(function () {
       var ext = extOf(u);
       var k = seqKey(u);
       var count = k ? (groups[k] || 0) : 0;
+      // 目录下已有清单：强分片容器（ts/m2ts/m4s/m4a/aac）无论命名模式如何都是分片
+      if (manifestDirs[dirOf(u)] && /^(ts|m2ts|m4s|m4a|aac)$/.test(ext)) { return true; }
       // 目录下已有清单：出现两次就足以认定是分片
       if (manifestDirs[dirOf(u)] && /^(ts|m4s|mp4|m4a|aac|webm)$/.test(ext)) { return count >= 2; }
       return count >= 3;
@@ -1254,10 +1376,14 @@ const COLLECT_SNIPPET = `(function () {
     // 先补齐缺元数据的，再试播其余视频：probeOk 用于判断是否为登录态/防盗链资源
     for (i = 0; i < res.videos.length && vidTargets.length < 12; i++) {
       var v = res.videos[i];
+      // 已配对音轨的 DASH 视频轨（如 B 站）元数据已全（宽高/时长由 playinfo 提供），
+      // 跳过探测可避免对防盗链 m4s 直链无谓地等 4s，防止整体解析超时。
+      if (v.audioTrackUrl) { v.probeOk = true; continue; }
       if (/^https?:/i.test(v.url) && (!v.duration || !v.w || !v.h)) { vidTargets.push(v); }
     }
     for (i = 0; i < res.videos.length && vidTargets.length < 12; i++) {
       var v2 = res.videos[i];
+      if (v2.audioTrackUrl) { continue; }
       if (/^https?:/i.test(v2.url) && vidTargets.indexOf(v2) < 0) { vidTargets.push(v2); }
     }
     var jobs = [];
@@ -1291,6 +1417,7 @@ const COLLECT_SNIPPET = `(function () {
     };
     try {
       MD.autoScroll(2500)
+        .then(function () { return MD.waitForBilibiliDash(3500); })
         .then(function () { return MD.collect(); })
         .then(function (res) { return MD.enrich(res); })
         .then(function (res) { send({ __md: 'result', payload: res }); })

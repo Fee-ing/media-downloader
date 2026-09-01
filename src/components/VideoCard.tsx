@@ -28,6 +28,9 @@ export default function VideoCard({
   const unplayable = item.playback === 'unplayable';
   const streamLabel =
     item.streamKind === 'hls' ? 'HLS' : item.streamKind === 'dash' ? 'DASH' : '';
+  // 已合并的 DASH 多轨资源：徽标展示轨道数量（清晰度/音轨/备用码率）
+  const trackLabel =
+    item.trackCount && item.trackCount > 1 ? `DASH · ${item.trackCount} 轨` : streamLabel;
 
   return (
     <Pressable
@@ -63,9 +66,9 @@ export default function VideoCard({
           </View>
         )}
 
-        {streamLabel ? (
+        {trackLabel ? (
           <View style={styles.streamBadge}>
-            <Text style={styles.streamText}>{streamLabel}</Text>
+            <Text style={styles.streamText}>{trackLabel}</Text>
           </View>
         ) : null}
 

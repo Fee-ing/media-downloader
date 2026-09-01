@@ -6,8 +6,8 @@ export const TIMING = {
   SETTLE_TIMEOUT: 12_000,
   /** 静置阶段的轮询间隔 */
   SETTLE_INTERVAL: 500,
-  /** 抽取脚本的整体兜底超时 */
-  EXTRACT_TIMEOUT: 20_000,
+  /** 抽取脚本的整体兜底超时（含 B 站 playinfo 等待 + 采集，留足余量） */
+  EXTRACT_TIMEOUT: 35_000,
   /** 单个文件大小探测超时 */
   PROBE_TIMEOUT: 8_000,
   /** 文件大小探测并发数 */
