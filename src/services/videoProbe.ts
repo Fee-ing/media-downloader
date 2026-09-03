@@ -136,7 +136,9 @@ async function request(
       }
     }
     return { ok: response.ok, status: response.status, headers, bytes };
-  } catch {
+  } catch (error) {
+    // 超时 / 网络错误 / CORS 等都会被这里吞掉，打印以便定位抓取失败原因
+    console.warn('[videoProbe] 请求失败（超时/CORS/网络/DNS）：', init.method, url, error);
     return null;
   } finally {
     clearTimeout(timer);
@@ -184,7 +186,11 @@ async function fetchManifest(
     { method: 'GET', headers: { ...headers, Range: `bytes=0-${LIMITS.PLAYLIST_BYTES - 1}` } },
     timeout,
   );
-  if (!res || !res.bytes || !res.ok) return null;
+  if (!res || !res.bytes || !res.ok) {
+    // 清单拉取失败：多因防盗链(403)/签名失效(404)/服务器不支持 Range
+    console.warn('[videoProbe] 清单拉取失败：', url, res ? `HTTP ${res.status}` : '无响应');
+    return null;
+  }
   const total =
     parseContentRange(res.headers['content-range']) ??
     parseContentLength(res.headers['content-length']);
@@ -219,11 +225,21 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
     if (fresh) {
       text = fresh.text;
       total = fresh.total;
+    } else {
+      console.warn('[videoProbe] 补全 m3u8 清单失败（首次抓取可能被截断或无法访问）：', url, {
+        hadText: !!text,
+        textLen: text.length,
+      });
     }
   }
 
   const playlist = text ? parseM3u8(text, url) : null;
   if (!playlist) {
+    console.warn('[videoProbe] m3u8 解析失败：内容不是有效 HLS 清单', url, {
+      contentType: params.contentType,
+      textLen: text.length,
+      head: text.slice(0, 200),
+    });
     return { ...base, status: 'unplayable', note: '播放列表内容异常，不是有效的 HLS 清单' };
   }
   if (playlist.encrypted) {
@@ -252,6 +268,8 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
             : 1;
         duration = subList.duration > 0 ? subList.duration * subRatio : undefined;
       }
+    } else {
+      console.warn('[videoProbe] 主列表子清单拉取失败（变体地址可能无法直接访问）：', best.url);
     }
     // 清单的体积没有参考意义，按时长 × 码率估算真实大小
     if (duration && best.bandwidth) {
@@ -265,7 +283,8 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
       size,
       width: best.width,
       height: best.height,
-      note: 'HLS 自适应流：可在预览中播放，暂不支持直接下载保存',
+      downloadable: true,
+      note: 'HLS 自适应流：已支持下载并转封装为 MP4',
     };
   }
 
@@ -279,7 +298,10 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
   let size: number | undefined;
   const first = playlist.segments[0];
   const seg = await request(first, { method: 'HEAD', headers }, Math.min(timeout, 8_000));
-  if (seg && !seg.ok) {
+  if (!seg) {
+    console.warn('[videoProbe] m3u8 首个分片 HEAD 请求无响应（超时/CORS/防盗链）：', first);
+  } else if (!seg.ok) {
+    console.warn('[videoProbe] m3u8 首个分片不可达：', first, `HTTP ${seg.status}`);
     return {
       ...base,
       status: 'unplayable',
@@ -295,7 +317,8 @@ async function probeHls(params: HlsParams): Promise<VideoProbeResult> {
     status: 'playable',
     duration,
     size,
-    note: 'HLS 流媒体：可在预览中播放，暂不支持直接下载保存',
+    downloadable: true,
+    note: 'HLS 流媒体：已支持下载并转封装为 MP4',
   };
 }
 
@@ -720,7 +743,9 @@ export async function probeVideoItem(
   ctx: VideoProbeContext = {},
 ): Promise<VideoProbeResult> {
   const timeout = ctx.timeout ?? TIMING.VIDEO_PROBE_TIMEOUT;
-  const headers = requestHeaders(item.url, ctx);
+  // 把资源自身已记录的请求头（如提取时记录的精确 Referer）作为基础，requestHeaders
+  // 不会覆盖已存在的 Referer，从而让播放器包裹页的防盗链 Referer 优先于页面地址生效。
+  const headers = requestHeaders(item.url, ctx, item.headers || {});
 
   if (!/^https?:/i.test(item.url)) {
     return {
@@ -736,20 +761,15 @@ export async function probeVideoItem(
   let body: Uint8Array | undefined;
 
   if (!head || !head.ok) {
-    // HEAD 常被 CDN / WAF 直接拒绝（405/403），不能只凭它下结论，降级为 Range GET 再判定
-    if (head && (head.status === 404 || head.status === 410)) {
-      // 站点适配层已确认有效的资源（B 站 playinfo 的 DASH 直链等），HEAD 返回 404/410
-      // 通常是 CDN 对 HEAD 方法的限制或签名节点差异，真实播放器带 Referer 用 GET 能访问，
-      // 不应据此判「资源已失效」而隐藏整条。
-      if (isConfirmedValidSource(item)) {
-        return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
-      }
-      return {
-        status: 'unplayable',
-        downloadable: false,
-        headers,
-        note: statusNote(head.status, item.pageProbeOk),
-      };
+    if (!head) {
+      console.warn('[videoProbe] HEAD 无响应（超时/CORS/网络/证书）：', item.url);
+    }
+    // HEAD 常被 CDN / WAF 拒绝（405/403），很多 CDN 连 404 也是 HEAD 方法本身不被支持
+    // （如 cdn.ryplay12.com：HEAD→404，但 GET / Range GET→200），不能只凭 HEAD 下结论。
+    // 站点适配层已确认有效的资源（B 站 playinfo 的 DASH 直链等）可信任上游直接放行；
+    // 其余情况必须真正发一次 Range GET 再判定，绝不能把 HEAD 的 404/410 当成「资源失效」而隐藏整条。
+    if (head && (head.status === 404 || head.status === 410) && isConfirmedValidSource(item)) {
+      return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
     }
     const fallback = await request(
       item.url,
@@ -757,6 +777,7 @@ export async function probeVideoItem(
       timeout,
     );
     if (!fallback) {
+      console.warn('[videoProbe] 降级 Range GET 无响应（资源可能依赖登录态/防盗链/签名）：', item.url);
       // 探测请求本身失败（App 网络层对自定义端口 / 签名直链常因证书或超时失败），
       // 但若上游站点适配层已明确确认这是有效资源（配对了独立音轨的 DASH 视频轨，
       // 或直接来自页面 playinfo），则信任上游、降级为可播放——真实播放器带 Referer
@@ -776,6 +797,7 @@ export async function probeVideoItem(
       };
     }
     if (!fallback.ok) {
+      console.warn('[videoProbe] 降级 Range GET 响应异常：', item.url, `HTTP ${fallback.status}`);
       if (isConfirmedValidSource(item)) {
         return { status: 'playable', downloadable: true, headers, note: '来源已确认有效（探测受限，信任上游）', probeSkipped: true };
       }
@@ -850,6 +872,7 @@ export async function probeVideoItem(
   if (body && body.length) {
     const sniffed = sniffFormat(body);
     if (sniffed?.markup === 'html') {
+      console.warn('[videoProbe] 嗅探到 HTML（可能是错误页/登录页，并非视频）：', item.url, { contentType });
       return {
         status: 'unplayable',
         downloadable: false,
@@ -875,6 +898,7 @@ export async function probeVideoItem(
     if (contentType.indexOf('video/') === 0) {
       guess = formatFromContentType(contentType) ?? 'mp4';
     } else {
+      console.warn('[videoProbe] 无法识别视频格式：', item.url, { contentType, fileName });
       return {
         status: 'unplayable',
         downloadable: false,
@@ -1057,7 +1081,8 @@ export async function probeVideos(items: MediaItem[], options: ProbeVideosOption
           timeout: options.timeout,
         });
         applyResult(item, result);
-      } catch {
+      } catch (error) {
+        console.warn('[videoProbe] 探测过程抛出异常：', item.url, error);
         item.playback = 'unplayable';
         item.downloadable = false;
         item.playbackNote = '校验该资源时出错，可能无法正常播放';

@@ -78,6 +78,8 @@ interface Candidate {
   source?: string;
   contentType?: string;
   fallbackUrl?: string;
+  /** 精确防盗链 Referer（资源来自播放器包裹页时，用包裹页地址而非 vod 页面） */
+  referer?: string;
   headers?: Record<string, string>;
   viaNetwork?: boolean;
   /** 请求发起者（video / audio / fetch / xmlhttprequest），来自 Resource Timing */
@@ -554,6 +556,8 @@ function toCandidate(raw: {
   source?: string;
   contentType?: string;
   fallbackUrl?: string;
+  /** 精确防盗链 Referer（资源来自播放器包裹页时，用包裹页地址而非 vod 页面） */
+  referer?: string;
   headers?: Record<string, string>;
   viaNetwork?: boolean;
   initiator?: string;
@@ -575,6 +579,7 @@ function toCandidate(raw: {
     source: raw.source,
     contentType: raw.contentType || undefined,
     fallbackUrl: raw.fallbackUrl || undefined,
+    referer: raw.referer || undefined,
     headers: raw.headers,
     viaNetwork: raw.viaNetwork,
     initiator: raw.initiator,
@@ -616,6 +621,7 @@ function toMediaItem(c: Candidate, index: number): MediaItem {
     source: c.source,
     contentType: c.contentType,
     fallbackUrl: c.fallbackUrl,
+    referer: c.referer,
     headers: c.headers && Object.keys(c.headers).length ? c.headers : undefined,
     viaNetwork: c.viaNetwork,
     pageProbeOk: c.probeOk,
@@ -663,7 +669,9 @@ function attachAntiLeechHeaders(c: Candidate, payload: RawScrapePayload): Candid
     extra['Cookie'] = payload.cookie.trim();
   }
   if (!extra['Referer']) {
-    extra['Referer'] = pageUrl;
+    // 优先用提取时记录的精确 Referer（资源来自播放器包裹页 ?url=<m3u8> 时，原生播放器
+    // 正是拿包裹页当 Referer 发请求，CDN 才放行；否则退回页面地址兜底）。
+    extra['Referer'] = c.referer || pageUrl;
   }
   if (!sameHost) {
     // 跨站直链通常还需 Origin / 桌面 UA 才能放行（B 站、部分 HLS/DASH CDN 均如此）

@@ -68,6 +68,12 @@ export interface MediaItem {
   downloadable?: boolean;
   /** 下载/播放时需要携带的请求头（Referer、Cookie 等） */
   headers?: Record<string, string>;
+  /**
+   * 精确防盗链 Referer：当资源是从「播放器包裹页」(如 ?url=<m3u8>) 里抠出来时，
+   * 原生播放器正是在那个包裹页上发请求，CDN 校验的 Referer 就是它；用页面地址
+   * (vod/play/...) 当 Referer 往往被拒（404/403）。有此字段时探测优先用它。
+   */
+  referer?: string;
   /** 由网络层嗅探发现，而非 DOM 节点 */
   viaNetwork?: boolean;
   /** 页面内 <video> 试播是否成功（用于判断是否为登录态/防盗链资源） */

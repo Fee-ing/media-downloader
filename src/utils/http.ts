@@ -23,12 +23,18 @@ export interface RequestContext {
  * 很多站点靠 Referer 做防盗链，登录态资源还需要 Cookie；
  * Cookie 只在同源（含子域）时携带，避免把站点会话泄漏给第三方域。
  */
-export function requestHeaders(url: string, ctx: RequestContext = {}): Record<string, string> {
+export function requestHeaders(
+  url: string,
+  ctx: RequestContext = {},
+  base: Record<string, string> = {},
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: '*/*',
     'User-Agent': DESKTOP_UA,
+    ...base,
   };
-  if (ctx.pageUrl) headers.Referer = ctx.pageUrl;
+  // 不覆盖调用方已明确给出的 Referer（如资源提取时记录的精确包裹页 Referer）
+  if (!headers.Referer && ctx.pageUrl) headers.Referer = ctx.pageUrl;
   if (ctx.pageCookie && ctx.pageUrl && isSameHost(url, ctx.pageUrl)) {
     headers.Cookie = ctx.pageCookie;
   }

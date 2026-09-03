@@ -637,9 +637,39 @@ const NET_SNIPPET = `(function () {
     return RE.dataApi.test(full);
   }
 
+  // 放大 Resource Timing 缓冲：HLS 站点「先拉一次 m3u8 清单、再拉成百上千个 ts 分片」，
+  // 默认缓冲（约 150 条）会被分片挤爆，导致早期的 m3u8 清单从 performance 里消失；
+  // 而清单只请求一次——一旦被挤出就再也捞不回来。放大到 2000 让清单始终留在缓冲里。
+  try {
+    if (performance && typeof performance.setResourceTimingBufferSize === 'function') {
+      performance.setResourceTimingBufferSize(2000);
+    }
+  } catch (e) {}
+
+  // 把已有的 performance resource 条目补进网络层候选。post-load 注入的脚本，
+  // 页面加载初期、以及「点解析之前 hls.js 就拉走的 m3u8」都不会经过下面的实时钩子，
+  // 必须靠历史条目兜底。采集时再扫一遍，可捞回注入过晚时漏掉的请求。
+  MD.scanResourceTiming = function () {
+    try {
+      if (performance && typeof performance.getEntriesByType === 'function') {
+        var past = performance.getEntriesByType('resource') || [];
+        for (var pi0 = 0; pi0 < past.length; pi0++) {
+          var pe = past[pi0];
+          var psize = pe.encodedBodySize || pe.decodedBodySize || pe.transferSize || 0;
+          MD.netPush(pe.name, { size: psize, initiator: pe.initiatorType || '' });
+        }
+      }
+    } catch (e) {}
+  };
+
   MD.startNet = function () {
     if (NET.started) { return; }
     NET.started = true;
+
+    // 0) Resource Timing 兜底：脚本是 post-load 注入的，页面加载初期发出的请求
+    //    （含 m3u8 这类在「点解析」之前就被 hls.js 拉取的清单）不会进入下面的实时
+    //    观察者。把历史 performance 条目补一遍，否则走 HLS/MSE 的页面整条漏抓。
+    MD.scanResourceTiming();
 
     // 1) Resource Timing：覆盖 <video>/XHR/fetch 等各类请求，还能拿到真实体积与 initiatorType
     try {
@@ -840,6 +870,8 @@ const COLLECT_SNIPPET = `(function () {
   var RE = MD.RE;
   var NET = MD.net;
   var abs = MD.abs;
+  var hostOf = MD.hostOf;
+  var isJunk = MD.isJunk;
   var text = MD.text;
   var attrFrom = MD.attrFrom;
   var LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-url', 'data-echo', 'data-image', 'data-href', 'data-fallback-src', 'data-video-src', 'data-mp4'];
@@ -1274,6 +1306,122 @@ const COLLECT_SNIPPET = `(function () {
 
     // ---------- 视频：④ 网络层 ----------
     var netList = NET.entries || [];
+
+    // ④-b) 通用内嵌媒体地址提取：不挑参数名，直接从任意文本里抠形如
+    // 「https://...xxx.m3u8」的绝对地址。很多影视站（如本例 xiaoheimi.cc）把真实
+    // m3u8 藏在包裹页 URL 的查询参数 / 内联 script / JSON 里（?url=<真实地址>&next=...），
+    // 而真实 m3u8/ts 由原生 HLS 播放器（AVPlayer / ExoPlayer）直接拉取，根本不进 WebView
+    // 的 performance / XHR / fetch 日志——网络钩子永远抓不到。此时唯一可靠来源就是页面
+    // 文本里「内嵌的绝对媒体 URL」。非贪婪匹配 + 在扩展名处截断，避免把 &next=... 吞进来。
+    try {
+      // 只扫当前页 URL + performance 资源名（本例的 m3u8 就藏在这两个来源里）。
+      // 刻意不扫内联 <script> 全文：脚本文本可能极大，正则通配回溯在个别 WebView 内核
+      // 上会退化为灾难性慢匹配，直接卡死解析。覆盖绝大多数「原生播放 + URL 包裹」站点。
+      var wrapSources = [location.href || ''];
+      if (performance && typeof performance.getEntriesByType === 'function') {
+        var _pr = performance.getEntriesByType('resource') || [];
+        for (var _wi = 0; _wi < _pr.length; _wi++) { wrapSources.push(_pr[_wi].name); }
+      }
+      // 线性、有界、零正则的扫描器：找到每个 http(s):// 起点，向右取到空白/引号/</> 为止，
+      // 再判扩展名。绝不会出现正则回溯导致的同步死循环（这是之前卡死的根因）。
+      // 关键修复：本例 m3u8 藏在包裹 URL 的「查询参数值」里（?url=<真实m3u8>&next=...），
+      // 外层 URL 结尾是 .html、不带媒体扩展名，会被直接拒掉。所以对每个 token 还要拆分
+      // 其所有查询参数值，对参数值（可能又是一个完整 http(s) URL）再递归扫描，才能抠出内嵌地址。
+      var MEDIA_EXTS = ['.m3u8', '.m3u', '.mpd', '.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi',
+        '.ogv', '.flv', '.wmv', '.ts', '.m2ts', '.mpg', '.mpeg', '.rmvb', '.3gp', '.3gp2', '.f4v'];
+      function mediaExtHit(u) {
+        if (!u) { return false; }
+        for (var e = 0; e < MEDIA_EXTS.length; e++) { if (u.indexOf(MEDIA_EXTS[e]) > -1) { return true; } }
+        return false;
+      }
+      // 规范化候选：① 若媒体扩展名只出现在「查询参数值」里（包裹页，如 /player/?url=<m3u8>），
+      //    主路径不含扩展名 → 丢弃，真实地址已由递归扫描单独抠出；② 若扩展名后紧跟非 ?/#
+      //    的污染字符（如 ...index.m3u8&next=...），截断污染尾巴，恢复成干净地址。
+      function cleanMediaToken(raw) {
+        if (!raw) { return null; }
+        var dotPos = -1, extLen = 0;
+        for (var e = 0; e < MEDIA_EXTS.length; e++) {
+          var idx = raw.indexOf(MEDIA_EXTS[e]);
+          if (idx > -1) { dotPos = idx; extLen = MEDIA_EXTS[e].length; break; }
+        }
+        if (dotPos < 0) { return null; }
+        var q = raw.indexOf('?');
+        var pathPart = q > -1 ? raw.slice(0, q) : raw;
+        // 扩展名必须落在「主路径」里（? 之前），否则是包裹页，丢弃
+        if (raw.slice(dotPos, dotPos + extLen) !== pathPart.slice(pathPart.length - extLen)) {
+          return null;
+        }
+        var rest = raw.slice(dotPos + extLen); // 扩展名之后的部分
+        if (rest.charAt(0) === '&') { return raw.slice(0, dotPos + extLen); } // 污染，截断
+        return raw; // .m3u8?token=1 这类合法带参保留
+      }
+      function scanTextForMediaUrls(text, depth) {
+        if (depth > 4) { return []; } // 防递归过深
+        var out2 = [];
+        if (!text) { return out2; }
+        var n = text.length, i = 0, guard = 0;
+        while (i < n && guard < 20000) {
+          guard++;
+          var h = text.indexOf('http', i);
+          if (h < 0) { break; }
+          if (text.substr(h, 7) !== 'http://' && text.substr(h, 8) !== 'https://') { i = h + 1; continue; }
+          var j = h;
+          while (j < n) {
+            var c = text.charCodeAt(j);
+            if (c <= 32 || c === 34 || c === 39 || c === 60 || c === 62) { break; } // 空白/"'/</>
+            j++;
+          }
+          var token = text.slice(h, j);
+          if (mediaExtHit(token)) { out2.push(token); }
+          // 拆分查询参数值（?a=1&url=<内嵌URL>&next=...），对内嵌值递归扫描
+          var q = token.indexOf('?');
+          if (q > -1) {
+            var query = token.slice(q + 1);
+            var parts = query.split(/[&]/);
+            for (var p = 0; p < parts.length; p++) {
+              var eq = parts[p].indexOf('=');
+              var val = eq > -1 ? parts[p].slice(eq + 1) : parts[p];
+              if (val && (val.indexOf('http://') === 0 || val.indexOf('https://') === 0)) {
+                var inner = scanTextForMediaUrls(val, depth + 1);
+                for (var k = 0; k < inner.length; k++) { out2.push(inner[k]); }
+              }
+            }
+          }
+          i = h + 1; // 从下一字符继续，能命中被包裹在参数里的内嵌 URL
+        }
+        return out2;
+      }
+      var _seenWrap = {};
+      for (var _ws = 0; _ws < wrapSources.length; _ws++) {
+        var _src = wrapSources[_ws];
+        if (!_src) { continue; }
+        // 若来源本身是「播放器包裹页」(?url=<m3u8> / /player/ 等)，则原生播放器正是在该
+        // 页面上发起请求，CDN 校验的 Referer 就是它。把包裹 URL 记为该来源抠出资源的
+        // Referer，探测时优先使用，避免用 vod/play 页面地址当 Referer 被 404/403。
+        var _srcReferer;
+        try { if (/[?&](?:url|src|file|play|m3u8?)=/i.test(_src) || _src.indexOf('/player/') > -1) { _srcReferer = _src; } } catch (e) {}
+        try { _src = decodeURIComponent(_src); } catch (e) {}
+        var _tsrc0 = Date.now();
+        var _tokens = scanTextForMediaUrls(_src, 0);
+        for (var _ti = 0; _ti < _tokens.length; _ti++) {
+          var _cand = _tokens[_ti];
+          try { _cand = decodeURIComponent(_cand); } catch (e) {}
+          // 规范化：丢弃包裹页（扩展名只在参数值里）、截断 &next= 之类污染尾巴
+          var _clean = cleanMediaToken(_cand);
+          if (!_clean) { continue; }
+          var _abs = abs(_clean);
+          if (!_abs || _seenWrap[_abs]) { continue; }
+          _seenWrap[_abs] = true;
+          if (isJunk(_abs)) { continue; }
+          // 仅当命中媒体扩展名 / MIME 提示 / 媒体域名 / 路径特征才收，避免普通链接误伤
+          if (RE.videoExt.test(_abs) || RE.audioExt.test(_abs) || RE.mimeHint.test(_abs) ||
+              RE.mediaHost.test(hostOf(_abs)) || RE.pathEvidence.test(_abs)) {
+            addVideo({ url: _abs, source: 'network', viaNetwork: true, title: '', referer: _srcReferer });
+          }
+        }
+      }
+    } catch (e) {}
+
     var plainOf = function (u) { return u.split('#')[0].split('?')[0]; };
     var dirOf = function (u) {
       var s = plainOf(u);
@@ -1343,16 +1491,20 @@ const COLLECT_SNIPPET = `(function () {
       if (!res.images[i].w || !res.images[i].h) { imgTargets.push(res.images[i]); }
     }
     // 先补齐缺元数据的，再试播其余视频：probeOk 用于判断是否为登录态/防盗链资源
+    var isManifestUrl = function (u) { return /\.(m3u8|m3u|mpd)(?:[?#]|$)/i.test(u || ''); };
     for (i = 0; i < res.videos.length && vidTargets.length < 12; i++) {
       var v = res.videos[i];
       // 已配对音轨的 DASH 视频轨（如 B 站）元数据已全（宽高/时长由 playinfo 提供），
       // 跳过探测可避免对防盗链 m4s 直链无谓地等 4s，防止整体解析超时。
       if (v.audioTrackUrl) { v.probeOk = true; continue; }
+      // HLS/DASH 清单（.m3u8/.mpd）走页内 <video> 探测无意义且易卡 4s，RN 侧 probeHls 会处理
+      if (isManifestUrl(v.url)) { v.probeOk = true; continue; }
       if (/^https?:/i.test(v.url) && (!v.duration || !v.w || !v.h)) { vidTargets.push(v); }
     }
     for (i = 0; i < res.videos.length && vidTargets.length < 12; i++) {
       var v2 = res.videos[i];
       if (v2.audioTrackUrl) { continue; }
+      if (isManifestUrl(v2.url)) { continue; }
       if (/^https?:/i.test(v2.url) && vidTargets.indexOf(v2) < 0) { vidTargets.push(v2); }
     }
     var jobs = [];
@@ -1388,19 +1540,28 @@ const COLLECT_SNIPPET = `(function () {
   var SITE_WAIT_MS = 8000;
 
   MD.extract = function () {
+    var sent = false;
     var send = function (payload) {
+      if (sent) { return; }
+      sent = true;
       try {
         window.ReactNativeWebView.postMessage(JSON.stringify(payload));
       } catch (e) {}
     };
+    // 看门狗：无论如何 20s 内必须回传，避免页面脚本异常（如正则灾难性回溯）导致解析
+    // 无限挂起、UI 卡死。到点强制兜底，保证用户体验。
+    var watchdog = setTimeout(function () {
+      send({ __md: 'error', message: '采集超时（看门狗兜底）：页面可能在 ④-b 扫描或 probe 阶段卡住' });
+    }, 20000);
     try {
       MD.autoScroll(2500)
         .then(function () { return MD.waitSites(SITE_WAIT_MS); })
-        .then(function () { return MD.collect(); })
+        .then(function () { MD.scanResourceTiming(); return MD.collect(); })
         .then(function (res) { return MD.enrich(res); })
-        .then(function (res) { send({ __md: 'result', payload: res }); })
-        .catch(function (err) { send({ __md: 'error', message: String((err && err.message) || err) }); });
+        .then(function (res) { clearTimeout(watchdog); send({ __md: 'result', payload: res }); })
+        .catch(function (err) { clearTimeout(watchdog); send({ __md: 'error', message: String((err && err.message) || err) }); });
     } catch (err) {
+      clearTimeout(watchdog);
       send({ __md: 'error', message: String((err && err.message) || err) });
     }
   };

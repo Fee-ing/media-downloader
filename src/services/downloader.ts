@@ -7,6 +7,7 @@ import { DESKTOP_UA } from '../constants';
 import type { MediaItem } from '../types';
 import { buildFileName } from '../utils/url';
 import { muxFragmentedMp4Files } from './mp4Muxer';
+import { downloadHls } from './hlsDownloader';
 
 export type SaveResult = 'gallery' | 'shared' | 'file' | 'cancelled';
 
@@ -171,7 +172,14 @@ export async function downloadMedia(
   }
 
   const dir = getDownloadDir();
-  const fallbackExt = item.kind === 'image' ? '.jpg' : (item.format ? `.${item.format}` : '.mp4');
+  const fallbackExt =
+    item.kind === 'image'
+      ? '.jpg'
+      : item.streamKind === 'hls'
+      ? '.mp4'
+      : item.format
+      ? `.${item.format}`
+      : '.mp4';
   const name = buildFileName(item.url, item.title, fallbackExt);
   const file = new File(dir, uniqueName(dir, name));
 
@@ -184,16 +192,15 @@ export async function downloadMedia(
 
   // DASH 音画分离（配对了独立伴音轨的视频轨）：合并成单个 MP4 再下载
   const separated = isSeparatedDash(item);
-  console.log('[DL]', {
-    separated,
-    hasAudio: audioUris.length > 0,
-    audioCount: audioUris.length,
-    audio: audioUris.map(u => u.slice(0, 80)),
-    url: item.url.slice(0, 80),
-    headers,
-  });
 
-  const target = separated
+  // HLS(.m3u8)：下载所有分片并转封装为可播放的 .mp4（纯 JS，无需原生依赖）
+  const isHls = item.streamKind === 'hls' || /\.m3u8(\?|$)/i.test(item.url);
+  const target = isHls
+    ? await downloadHls(item, file, headers, {
+        onProgress: (pct) => options.onProgress?.(pct / 100),
+        signal: options.signal,
+      })
+    : separated
     ? await downloadMuxed(item, audioUris, file, headers, options)
     : await downloadSingle(item.url, file, headers, options.onProgress, options.signal);
 
