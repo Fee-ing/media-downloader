@@ -20,10 +20,12 @@ import type {
   VideoStreamKind,
 } from '../types';
 import { fileNameFromUrl } from '../utils/url';
+import { siteNotices, type SiteDebug } from './sites';
 import {
   baseScore,
   classifyStream,
   dirOfUrl,
+  isAudioTrackLike,
   isJunkUrl,
   isLikelyMediaCdn,
   isManifestUrl,
@@ -47,17 +49,11 @@ export interface ScrapeStats {
   rawVideos: number;
   /** 被本层规则丢弃的候选数 */
   dropped: number;
-  /** B 站音画分离探测诊断（仅 bilibili 域名有意义），用于定位「无声 / 只下 m4s」问题 */
-  biliDebug?: {
-    isBili: boolean;
-    hasPlayinfo: boolean;
-    hasInitialState: boolean;
-    hasDash: boolean;
-    videoTracks: number;
-    audioTracks: number;
-    pickedAudio: boolean;
-    error?: string;
-  } | null;
+  /**
+   * 站点适配层的诊断信息（按站点 id 归档），用于定位「清晰度上不去 /
+   * 无声 / 只抓到 m4s」这类站点特有问题。
+   */
+  siteDebug?: Record<string, SiteDebug> | null;
 }
 
 export interface ScrapeOutcome {
@@ -65,6 +61,8 @@ export interface ScrapeOutcome {
   videos: MediaItem[];
   /** 一条都没抓到时给用户看的解释 */
   hint?: string;
+  /** 站点给出的补充提示（登录态、清晰度上限、是否退化到网络层嗅探） */
+  notices?: string[];
   stats: ScrapeStats;
 }
 
@@ -96,7 +94,61 @@ interface Candidate {
   variantUrls?: string[];
   /** 站点适配层显式声明的伴音轨（DASH 音轨多为 .m4s，URL 特征判不出来） */
   declaredAudio?: boolean;
+  /**
+   * 站点适配层声明的「同一视频的多清晰度」分组（如 B 站 = bvid + cid）。
+   * 打了标记后：各清晰度保留为独立条目，同档位的 CDN 镜像仍然合并。
+   */
+  variantGroup?: string;
+  /** 站点自己的清晰度档位号（B 站 qn） */
+  qualityId?: number;
+  /** 人类可读的清晰度标签（1080P60 / 4K …） */
+  qualityLabel?: string;
   score: number;
+}
+
+/** 像素面积：比较清晰度时用 */
+function areaOf(c: { width?: number; height?: number }): number {
+  return (c.width || 0) * (c.height || 0);
+}
+
+/** 去重字符串数组，保留顺序 */
+function dedupeStrings(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of arr) {
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * 用 other 的空缺字段补齐 keeper。
+ *
+ * keeper 的 url / score / variantGroup / qualityId / qualityLabel / declaredAudio
+ * 一概不动：这些是「这个条目是什么」的身份信息，从别的候选继承就会张冠李戴
+ * （同组里既有视频轨也有伴音轨，一继承 declaredAudio 就会把正片标成只有声音）。
+ */
+function absorbMissing(keeper: Candidate, other: Candidate): void {
+  keeper.title = keeper.title || other.title;
+  keeper.poster = keeper.poster || other.poster;
+  keeper.width = keeper.width || other.width;
+  keeper.height = keeper.height || other.height;
+  keeper.duration = keeper.duration || other.duration;
+  keeper.size = keeper.size || other.size;
+  keeper.source = keeper.source || other.source;
+  keeper.contentType = keeper.contentType || other.contentType;
+  keeper.fallbackUrl = keeper.fallbackUrl || other.fallbackUrl;
+  keeper.headers = { ...(other.headers || {}), ...(keeper.headers || {}) };
+  keeper.viaNetwork = keeper.viaNetwork || other.viaNetwork;
+  keeper.initiator = keeper.initiator || other.initiator;
+  keeper.probeOk = keeper.probeOk || other.probeOk;
+  keeper.streamKind = keeper.streamKind || other.streamKind;
+  if (!keeper.audioTrackUrl) keeper.audioTrackUrl = other.audioTrackUrl;
+  if (!keeper.audioTrackUrls || !keeper.audioTrackUrls.length) {
+    keeper.audioTrackUrls = other.audioTrackUrls;
+  }
 }
 
 function shortTitle(raw: string | undefined, url: string): string {
@@ -226,6 +278,9 @@ function dropSegments(candidates: Candidate[]): Candidate[] {
 
   return candidates.filter(c => {
     if (isManifestUrl(c.url)) return true; // 清单永远保留
+    // 站点适配层已明确声明档位的轨道（B 站 DASH 各清晰度）：编号稀疏
+    // （30280 / 30216 / 30064 …），很容易被 seqKey 误判成分片序列而整片丢掉
+    if (c.variantGroup) return true;
     const dir = dirOfUrl(c.url);
     // 清单目录下的强分片扩展名：命名再乱也是分片
     if (manifestDirs.has(dir) && isStrongSegmentUrl(c.url)) return false;
@@ -280,11 +335,19 @@ function isDashTrackGroup(group: Candidate[]): boolean {
  *
  * 在进探测与列表之前折成一条代表候选，其余轨道地址收进 variantUrls
  * 作为播放兜底，避免几十条 m4s 挤满探测预算（VIDEO_PROBE_MAX）与列表名额。
+ *
+ * 通用逻辑分不清「同一视频的不同清晰度」与「同一视频的不同 CDN 镜像」，
+ * 一律折成一条。站点适配层能分清（它从 playinfo 里读到了每档的宽高与档位号），
+ * 打了 variantGroup 的候选交给 collapseSiteVariants 按档位保留，不在这里折叠。
  */
 function foldM4sTracks(candidates: Candidate[]): Candidate[] {
   const groups = new Map<string, Candidate[]>();
   const rest: Candidate[] = [];
   candidates.forEach(c => {
+    if (c.variantGroup) {
+      rest.push(c);
+      return;
+    }
     const key = m4sTrackKeyOf(c.url);
     if (!key) {
       rest.push(c);
@@ -327,32 +390,14 @@ function foldM4sTracks(candidates: Candidate[]): Candidate[] {
     for (let i = 1; i < group.length; i++) {
       if (keeperScore(group[i]) > keeperScore(best)) best = group[i];
     }
-    // 以 best 为底座，用其余轨道补齐空缺字段（best 的 url/score 保持不变）
+    // 以 best 为底座，用其余轨道补齐空缺字段（best 的 url/score 保持不变）。
+    // 注意：declaredAudio 描述的是「这个 URL 自己是音轨还是视频轨」，
+    // **绝不能**从同组其它轨道继承 —— 同组里既有视频轨也有伴音轨，一继承就会把
+    // 视频轨代表标成音轨，正片随后被当成「只有声音」的条目处理掉。
+    // 同组其它轨道已配好的伴音轨则相反，代表没有时必须继承，否则音画配对丢失。
     const keeper: Candidate = { ...best };
     group.forEach(c => {
-      if (c === best) return;
-      keeper.title = keeper.title || c.title;
-      keeper.poster = keeper.poster || c.poster;
-      keeper.width = keeper.width || c.width;
-      keeper.height = keeper.height || c.height;
-      keeper.duration = keeper.duration || c.duration;
-      keeper.size = keeper.size || c.size;
-      keeper.source = keeper.source || c.source;
-      keeper.contentType = keeper.contentType || c.contentType;
-      keeper.fallbackUrl = keeper.fallbackUrl || c.fallbackUrl;
-      keeper.headers = { ...(c.headers || {}), ...(keeper.headers || {}) };
-      keeper.viaNetwork = keeper.viaNetwork || c.viaNetwork;
-      keeper.initiator = keeper.initiator || c.initiator;
-      keeper.probeOk = keeper.probeOk || c.probeOk;
-      keeper.streamKind = keeper.streamKind || c.streamKind;
-      // 注意：declaredAudio 描述的是「这个 URL 自己是音轨还是视频轨」，
-      // **绝不能**从同组其它轨道继承 —— 同组里既有视频轨也有伴音轨，一继承就会把
-      // 视频轨代表标成音轨，正片随后被当成「只有声音」的条目处理掉。
-      // 同组其它轨道已配好的伴音轨则相反，代表没有时必须继承，否则音画配对丢失。
-      if (!keeper.audioTrackUrl) keeper.audioTrackUrl = c.audioTrackUrl;
-      if (!keeper.audioTrackUrls || !keeper.audioTrackUrls.length) {
-        keeper.audioTrackUrls = c.audioTrackUrls;
-      }
+      if (c !== best) absorbMissing(keeper, c);
     });
     keeper.trackCount = group.length;
     // 备用轨道只收视频轨：音轨单独播放没有画面，不能进播放兜底链
@@ -376,6 +421,128 @@ function foldM4sTracks(candidates: Candidate[]): Candidate[] {
   return [...rest, ...folded];
 }
 
+/**
+ * 站点声明的多清晰度收口。
+ *
+ * 通用折叠逻辑会把同一视频的多条轨道压成一条，因为它分不清「不同清晰度」和
+ * 「不同 CDN 镜像」。站点适配层分得清：它从 playinfo 里读出了每档的宽高与档位号，
+ * 并给每条候选打了 variantGroup + qualityId + qualityLabel。
+ *
+ * 这里对打了标记的候选换一套规则：
+ * 1. 按（分辨率 + 档位号）分桶——同桶就是同一档的不同 CDN 镜像，合并成一条，
+ *    用镜像补齐主条目的空缺字段；
+ * 2. 桶与桶之间**不合并**——每一档清晰度都作为独立条目保留，用户可自行选择；
+ * 3. 组内按分辨率从高到低排序，最高清的排在最前；
+ * 4. 同组其它清晰度收进 variantUrls，作为主地址失效时的降级兜底；
+ * 5. 伴音轨广播给组内每条视频轨——B 站各档清晰度共用同一批音轨。
+ */
+function collapseSiteVariants(candidates: Candidate[]): Candidate[] {
+  const groups = new Map<string, Candidate[]>();
+  const rest: Candidate[] = [];
+  candidates.forEach(c => {
+    if (!c.variantGroup) {
+      rest.push(c);
+      return;
+    }
+    const list = groups.get(c.variantGroup);
+    if (list) list.push(c);
+    else groups.set(c.variantGroup, [c]);
+  });
+
+  const out: Candidate[] = [...rest];
+  groups.forEach(list => {
+    const isAudio = (c: Candidate) =>
+      isAudioTrackLike({
+        url: c.url,
+        contentType: c.contentType,
+        initiator: c.initiator,
+        declaredAudio: c.declaredAudio,
+      });
+    const audioLike = list.filter(isAudio);
+    const videoLike = list.filter(c => !isAudio(c));
+    // 组内没有视频轨（纯音频组）原样保留，交给通用逻辑处理
+    if (!videoLike.length) {
+      out.push(...list);
+      return;
+    }
+
+    const audioUrls = audioLike.map(a => a.url);
+    // 按档位分桶：同桶 = 同一清晰度的不同 CDN 镜像
+    const buckets = new Map<string, Candidate[]>();
+    videoLike.forEach(c => {
+      const key = `${c.width || 0}x${c.height || 0}|${c.qualityId || 0}`;
+      const bucket = buckets.get(key);
+      if (bucket) bucket.push(c);
+      else buckets.set(key, [c]);
+    });
+
+    const keepers: { keeper: Candidate; bucketVariants: string[] }[] = [];
+    buckets.forEach(bucket => {
+      let best = bucket[0];
+      for (let i = 1; i < bucket.length; i++) {
+        if (bucket[i].score > best.score) best = bucket[i];
+      }
+      const keeper: Candidate = { ...best };
+      // 桶内其余候选（同一清晰度的不同 CDN 镜像）：既补齐主条目的空缺字段，
+      // 又把它们的地址收进 variantUrls —— 主地址失效时可降级到镜像，不丢兜底。
+      const bucketVariants: string[] = [];
+      bucket.forEach(c => {
+        if (c === best) return;
+        absorbMissing(keeper, c);
+        if (c.url) bucketVariants.push(c.url);
+      });
+      keeper.trackCount = bucket.length;
+      // 伴音轨：本条自带的配对（站点适配层给的）排在前，组内识别到的排在后。
+      // 本轮识别出 0 条时绝不能把已有配对清成空数组，否则音画配对丢失。
+      keeper.audioTrackUrls = mergeAudioTrackUrls(
+        mergeAudioTrackUrls(
+          keeper.audioTrackUrls,
+          keeper.audioTrackUrl ? [keeper.audioTrackUrl] : [],
+        ),
+        audioUrls,
+      );
+      if (keeper.audioTrackUrls.length) keeper.audioTrackUrl = keeper.audioTrackUrls[0];
+      keepers.push({ keeper, bucketVariants });
+    });
+
+    // 分辨率高的排前面：用户默认看到 / 下载到的就是最高清那一档
+    keepers.sort(
+      (a, b) =>
+        areaOf(b.keeper) - areaOf(a.keeper) ||
+        (b.keeper.qualityId || 0) - (a.keeper.qualityId || 0),
+    );
+    const allUrls = keepers.map(k => k.keeper.url);
+    keepers.forEach(({ keeper, bucketVariants }) => {
+      // 兜底链 = 同分辨率镜像 + 其它清晰度的地址（主地址失效时按序降级）
+      keeper.variantUrls = dedupeStrings([
+        ...bucketVariants,
+        ...allUrls.filter(u => u !== keeper.url),
+      ]);
+    });
+    keepers.forEach(({ keeper }) => out.push(keeper));
+  });
+
+  return out;
+}
+
+/**
+ * 候选排序：站点声明的多清晰度组内按分辨率降序，其余按置信度降序。
+ *
+ * 同一视频的几档清晰度，来源与置信度完全相同（都来自 playinfo），按 score 排
+ * 会退化成「谁先被 addVideo 谁在前」。组内改按分辨率排，最高清的排第一：
+ * 列表默认展示、用户随手一点下载，拿到的都是最清晰的那条。
+ */
+function compareCandidates(a: Candidate, b: Candidate): number {
+  if (a.variantGroup && a.variantGroup === b.variantGroup) {
+    const diff = areaOf(b) - areaOf(a);
+    if (diff !== 0) return diff;
+    if ((a.qualityId || 0) !== (b.qualityId || 0)) {
+      return (b.qualityId || 0) - (a.qualityId || 0);
+    }
+  }
+  return b.score - a.score;
+}
+
 function toCandidate(raw: {
   url: string;
   poster?: string;
@@ -394,6 +561,9 @@ function toCandidate(raw: {
   audioTrackUrl?: string;
   audioTrackUrls?: string[];
   declaredAudio?: boolean;
+  variantGroup?: string;
+  qualityId?: number;
+  qualityLabel?: string;
 }): Candidate {
   const candidate: Candidate = {
     url: raw.url,
@@ -414,6 +584,9 @@ function toCandidate(raw: {
     audioTrackUrls: Array.isArray(raw.audioTrackUrls) && raw.audioTrackUrls.length > 0
       ? raw.audioTrackUrls
       : (raw.audioTrackUrl ? [raw.audioTrackUrl] : undefined),
+    variantGroup: raw.variantGroup || undefined,
+    qualityId: raw.qualityId || undefined,
+    qualityLabel: raw.qualityLabel || undefined,
     score: 0,
   };
   candidate.score = scoreCandidate(candidate);
@@ -452,6 +625,9 @@ function toMediaItem(c: Candidate, index: number): MediaItem {
     audioTrackUrls: c.audioTrackUrls,
     variantUrls: c.variantUrls,
     declaredAudio: c.declaredAudio,
+    variantGroup: c.variantGroup,
+    qualityId: c.qualityId,
+    qualityLabel: c.qualityLabel,
   };
 }
 
@@ -548,7 +724,8 @@ function buildHint(payload: RawScrapePayload, stats: ScrapeStats): string {
 /**
  * 通用抓取方法：把页面脚本回传的原始结果整合成展示用的媒体列表。
  *
- * 不区分站点，全部走页面脚本那一套规则。
+ * 不区分站点，全部走页面脚本那一套规则；只有「站点适配层显式声明」的
+ * 多清晰度分组（variantGroup）会走专门的收口分支，其余一律通用处理。
  * 任何一步出错都不会抛出——单条候选异常只是被丢掉，
  * 调用方拿到的永远是可渲染的列表。
  */
@@ -620,32 +797,52 @@ export async function scrapeMedia(payload: RawScrapePayload): Promise<ScrapeOutc
     });
   }
 
+  // 站点声明的分组广播给同资源的其它候选：网络层嗅探到的伴音轨 / CDN 镜像
+  // 与站点给出的轨道地址不同源（主机、路径前缀不同），但指纹（去掉 host 与
+  // 尾部编号后的路径）一致。广播后它们才与正片同组，音轨才不会被当成独立条目
+  // 展示、镜像才不会被当成另一档清晰度。
+  const groupByFingerprint = new Map<string, string>();
+  candidates.forEach(candidate => {
+    if (!candidate.variantGroup) return;
+    const key = mediaResourceFingerprint(candidate.url);
+    if (!groupByFingerprint.has(key)) groupByFingerprint.set(key, candidate.variantGroup);
+  });
+  if (groupByFingerprint.size) {
+    candidates.forEach(candidate => {
+      if (candidate.variantGroup) return;
+      const group = groupByFingerprint.get(mediaResourceFingerprint(candidate.url));
+      if (group) candidate.variantGroup = group;
+    });
+  }
+
   // 分片收口：把页面脚本漏掉的分片（DOM/JSON 来源、hash 命名）剔除，避免列表被重复分片挤满
   const kept = dropSegments(candidates);
   dropped += candidates.length - kept.length;
 
-  // DASH 轨道组折叠：同一视频的多条 .m4s 轨道（清晰度/音轨）折成一条代表，
+  // 站点声明的多清晰度按档位收口（各档保留为独立条目，同档镜像合并）
+  const collapsed = collapseSiteVariants(kept);
+  // 其余 .m4s 走通用轨道组折叠：同一视频的多条轨道压成一条代表，
   // 省下探测预算与列表名额，其余轨道地址作为播放兜底
-  const folded = foldM4sTracks(kept);
+  const folded = foldM4sTracks(collapsed);
 
   let videos = dedupe(folded)
-    .sort((a, b) => b.score - a.score)
+    .sort(compareCandidates)
     .slice(0, LIMITS.VIDEOS)
     .map(c => attachAntiLeechHeaders(c, payload))
     .map(toMediaItem);
 
-  // 视频标题统一为「网页标题_序号」，序号从 1 开始；仅有一个视频时不加序号。
-  // 网页标题缺失时回退为原候选标题（多为 URL 片段）。
+  // 视频标题统一为「网页标题_后缀」。
+  // 站点声明了清晰度时后缀用档位名（标题_1080P60），比序号有用得多——
+  // 同一视频的几档清晰度并列时，只有序号根本分不清该下哪一条。
+  // 其余场景沿用序号，仅有一个视频时不加后缀。
   const pageTitle = payload.title?.trim();
   if (videos.length > 0) {
-    if (videos.length === 1) {
-      videos = videos.map(v => ({ ...v, title: pageTitle || v.title }));
-    } else {
-      videos = videos.map((v, i) => ({
-        ...v,
-        title: `${pageTitle || v.title}_${i + 1}`,
-      }));
-    }
+    videos = videos.map((v, i) => {
+      const base = pageTitle || v.title;
+      if (v.qualityLabel) return { ...v, title: `${base}_${v.qualityLabel}` };
+      if (videos.length === 1) return { ...v, title: base };
+      return { ...v, title: `${base}_${i + 1}` };
+    });
   }
 
   const stats: ScrapeStats = {
@@ -654,7 +851,7 @@ export async function scrapeMedia(payload: RawScrapePayload): Promise<ScrapeOutc
     streamVideos: payload.streamVideos || 0,
     rawVideos: rawVideos.length,
     dropped,
-    biliDebug: payload.biliDebug || null,
+    siteDebug: payload.siteDebug || null,
   };
 
   const empty = !images.length && !videos.length;
@@ -662,6 +859,7 @@ export async function scrapeMedia(payload: RawScrapePayload): Promise<ScrapeOutc
     images,
     videos,
     hint: empty ? buildHint(payload, stats) : undefined,
+    notices: siteNotices(payload.siteDebug),
     stats,
   };
 }

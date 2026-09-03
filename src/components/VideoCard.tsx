@@ -31,6 +31,9 @@ export default function VideoCard({
   // 已合并的 DASH 多轨资源：徽标展示轨道数量（清晰度/音轨/备用码率）
   const trackLabel =
     item.trackCount && item.trackCount > 1 ? `DASH · ${item.trackCount} 轨` : streamLabel;
+  // 站点适配层给出的清晰度档位（1080P60 / 4K …）最有用，优先展示：
+  // 同一视频的几档清晰度并列时，靠它才能分清该下哪一条
+  const badgeLabel = item.qualityLabel || trackLabel;
 
   return (
     <Pressable
@@ -66,9 +69,9 @@ export default function VideoCard({
           </View>
         )}
 
-        {trackLabel ? (
-          <View style={styles.streamBadge}>
-            <Text style={styles.streamText}>{trackLabel}</Text>
+        {badgeLabel ? (
+          <View style={[styles.streamBadge, item.qualityLabel ? styles.qualityBadge : null]}>
+            <Text style={styles.streamText}>{badgeLabel}</Text>
           </View>
         ) : null}
 
@@ -182,6 +185,11 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     letterSpacing: 0.4,
+  },
+  /** 清晰度档位徽标：高亮一点，从一堆条目里一眼认出最高清那条 */
+  qualityBadge: {
+    backgroundColor: 'rgba(61,126,255,0.92)',
+    borderColor: 'rgba(255,255,255,0.35)',
   },
   durationBadge: {
     position: 'absolute',

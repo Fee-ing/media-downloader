@@ -181,11 +181,17 @@ export default function App() {
       const pageUrl = payload.pageUrl || taskUrl || undefined;
 
       // 唯一的抓取入口：页面脚本的候选在这里归一、过滤、去重、排序。
-      let { images: nextImages, videos: nextVideos, hint, stats } = await scrapeMedia(payload);
+      let {
+        images: nextImages,
+        videos: nextVideos,
+        hint,
+        notices,
+        stats,
+      } = await scrapeMedia(payload);
 
-      // [诊断] B 站音画分离排查：打印 playinfo 是否识别、首条视频是否带音轨与防盗链头
-      console.log('[BILI-DEBUG]', JSON.stringify(stats?.biliDebug || null));
-      console.log('[BILI-DEBUG] first video:', nextVideos[0]
+      // [诊断] 站点适配层：播放信息来源、清晰度档位、首条视频的音轨与防盗链头
+      console.log('[SITE-DEBUG]', JSON.stringify(stats?.siteDebug || null));
+      console.log('[SITE-DEBUG] first video:', nextVideos[0]
         ? JSON.stringify({
             url: nextVideos[0].url?.slice(0, 80),
             audioTrackUrl: nextVideos[0].audioTrackUrl ? nextVideos[0].audioTrackUrl.slice(0, 80) : null,
@@ -231,6 +237,21 @@ export default function App() {
         // 1) 分辨率+时长+体积一致的重复资源；2) 同源但元数据残缺的 .m4s 轨道。
         nextVideos = dedupeProbedVideos(nextVideos);
         setVideos(nextVideos);
+
+        // 站点提示（未登录导致清晰度受限、退化到网络层嗅探等）只附在首条视频上，
+        // 免得同一句话在每张卡片上重复出现
+        if (notices?.length && nextVideos.length) {
+          const note = notices.join('；');
+          nextVideos = nextVideos.map((item, index) =>
+            index === 0
+              ? {
+                  ...item,
+                  playbackNote: item.playbackNote ? `${item.playbackNote}；${note}` : note,
+                }
+              : item,
+          );
+          setVideos(nextVideos);
+        }
       }
 
       // 再补充文件体积（已判定不可播放的视频不再浪费请求）

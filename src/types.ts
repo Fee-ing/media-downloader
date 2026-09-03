@@ -1,3 +1,5 @@
+import type { SiteDebug } from './services/sites/types';
+
 export type MediaKind = 'image' | 'video';
 
 /** 视频可播放性校验结果：正常 / 已修复可用 / 无法播放 */
@@ -44,6 +46,18 @@ export interface MediaItem {
   audioTrackUrls?: string[];
   /** 同组其余轨道地址（低码率视频轨等），播放失败时按序兜底 */
   variantUrls?: string[];
+  /**
+   * 站点适配层声明的「同一视频的多清晰度」分组（如 B 站 = bvid + cid）。
+   *
+   * 打了这个标记的条目不会被通用折叠逻辑压成一条：每一档清晰度各自保留为
+   * 独立条目供用户选择，同档位的不同 CDN 镜像仍然合并。
+   * 详见 services/sites/types.ts 的契约说明。
+   */
+  variantGroup?: string;
+  /** 站点自己的清晰度档位号（B 站 qn：16=360P、80=1080P、116=1080P60 …） */
+  qualityId?: number;
+  /** 人类可读的清晰度标签（1080P60 / 4K …），由站点适配层给出 */
+  qualityLabel?: string;
   /**
    * 页面脚本的站点适配层显式声明的伴音轨（如 B 站 playinfo 的 dash.audio）。
    * 仅用于音视频轨判定，不对外展示；DASH 音轨多为 .m4s，靠 URL / Content-Type
@@ -116,17 +130,13 @@ export interface RawScrapePayload {
    * 据此标记同轨的 CDN 镜像为伴音轨，避免音轨被当成视频轨选成代表条目。
    */
   audioUrls?: string[];
-  /** B 站音画分离探测诊断（仅 bilibili 域名有意义） */
-  biliDebug?: {
-    isBili: boolean;
-    hasPlayinfo: boolean;
-    hasInitialState: boolean;
-    hasDash: boolean;
-    videoTracks: number;
-    audioTracks: number;
-    pickedAudio: boolean;
-    error?: string;
-  } | null;
+  /**
+   * 站点适配层的诊断信息，按站点 id 归档。
+   *
+   * 用于定位「清晰度上不去 / 没有声音 / 只抓到 m4s」这类站点特有问题：
+   * 播放信息从哪来的、有没有退化到网络层嗅探、站点是否登录、拿到了几档清晰度。
+   */
+  siteDebug?: Record<string, SiteDebug> | null;
   images: Array<{
     url: string;
     w?: number;
@@ -169,6 +179,15 @@ export interface RawScrapePayload {
     audioTrackUrl?: string;
     /** 全部伴随音轨地址（多码率音轨按优劣排序），首条与 audioTrackUrl 一致 */
     audioTrackUrls?: string[];
+    /**
+     * 站点适配层声明的「同一视频的多清晰度」分组。
+     * 打了标记的候选会按清晰度档位各自保留为独立条目，不被折叠成一条。
+     */
+    variantGroup?: string;
+    /** 站点自己的清晰度档位号（B 站 qn） */
+    qualityId?: number;
+    /** 人类可读的清晰度标签（1080P60 / 4K …） */
+    qualityLabel?: string;
   }>;
 }
 

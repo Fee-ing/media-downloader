@@ -367,6 +367,18 @@ export function baseScore(source?: string): number {
 // 探测完成后的二次去重（按内容特征，而非 URL）
 // ============================================================
 
+/** 去重字符串数组，保留顺序 */
+function dedupeStrings(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of arr) {
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 /** 两条时长能否视为同一段视频：未知时长不拦截，已知则要求相差很小 */
 function durationsCompatible(a: number | undefined, b: number | undefined): boolean {
   if (!a || !b) return true;
@@ -382,15 +394,22 @@ function playbackWeight(item: MediaItem): number {
   return 1;
 }
 
-/** 同组内比较：可播放 > 可下载 > 分辨率完整且更大 > 体积更大（正数表示 b 更值得留） */
+/**
+ * 同组内比较谁更值得留：分辨率 > 可下载 > 可播放 > 体积（正数表示 b 更值得留）。
+ *
+ * 分辨率排在第一位：用户要的是「更清晰的那条」。可播放性只作同分辨率时的
+ * 决胜项——探测失败的原因常常是 CDN 拒绝 HEAD、签名节点差异这类偶发因素，
+ * 同一视频的高清轨可能恰好探测失败而低清轨成功，若让可播放性优先，留下的
+ * 反而是低清那条，与「抓取尽可能清晰的视频」这个目标相悖。
+ */
 function compareKeeper(a: MediaItem, b: MediaItem): number {
-  const pa = playbackWeight(a);
-  const pb = playbackWeight(b);
-  if (pa !== pb) return pb - pa;
-  if (!!a.downloadable !== !!b.downloadable) return (b.downloadable ? 1 : 0) - (a.downloadable ? 1 : 0);
   const areaA = a.width && a.height ? a.width * a.height : 0;
   const areaB = b.width && b.height ? b.width * b.height : 0;
   if (areaA !== areaB) return areaB - areaA;
+  if (!!a.downloadable !== !!b.downloadable) return (b.downloadable ? 1 : 0) - (a.downloadable ? 1 : 0);
+  const pa = playbackWeight(a);
+  const pb = playbackWeight(b);
+  if (pa !== pb) return pb - pa;
   return (b.size || 0) - (a.size || 0);
 }
 
@@ -437,7 +456,10 @@ function mergeInto(keep: MediaItem, drop: MediaItem): void {
  *
  * 1. 精确匹配（任何格式）：分辨率 + 体积一致，且时长一致（整十秒容差）或
  *    双方时长均未知（渐进式视频探测不产时长）→ 视为同一视频；
- * 2. .m4s 容错匹配：同目录 + 同文件名前缀的 m4s（DASH 不同清晰度/码率轨），
+ * 2. 站点声明的多清晰度分组（variantGroup，如 B 站的 bvid + cid）：
+ *    伴音轨收编进各视频轨、不再单独展示；视频轨按分辨率分桶，同分辨率的
+ *    CDN 镜像合并，**不同清晰度各留一条**，用户可自行选择；
+ * 3. .m4s 容错匹配：同目录 + 同文件名前缀的 m4s（DASH 不同清晰度/码率轨），
  *    即使时长未知、分辨率未知、体积不同，播放的也是同一段视频。
  *    整组合并为一条代表条目：伴音轨地址收进 audioTrackUrl，其余轨道地址
  *    收进 variantUrls 作为播放兜底，不再单独展示（避免音轨被标成「无法播放」）。
@@ -470,10 +492,72 @@ export function dedupeProbedVideos(items: MediaItem[]): MediaItem[] {
     });
   });
 
-  // Pass 2：.m4s 轨道容错匹配
+  // Pass 2：站点声明的多清晰度分组（B 站各清晰度共用目录与前缀，只有分辨率不同）
+  const siteGroups = new Map<string, MediaItem[]>();
+  items.forEach(item => {
+    if (item.kind !== 'video' || dropped.has(item) || !item.variantGroup) return;
+    const group = siteGroups.get(item.variantGroup);
+    if (group) group.push(item);
+    else siteGroups.set(item.variantGroup, [item]);
+  });
+  siteGroups.forEach(group => {
+    const audio = group.filter(item => isAudioTrackLike(item));
+    const videoLike = group.filter(item => !audio.includes(item));
+    // 组内没有视频轨（纯音轨）就无从收编，原样留给后面的通用逻辑
+    if (!videoLike.length) return;
+    // 按分辨率分桶：同桶 = 同一清晰度的不同 CDN 镜像，合并成一条；
+    // 桶与桶之间不合并，各清晰度保留为独立条目供用户选择
+    const buckets = new Map<string, MediaItem[]>();
+    videoLike.forEach(item => {
+      const key = `${item.width || 0}x${item.height || 0}`;
+      const bucket = buckets.get(key);
+      if (bucket) bucket.push(item);
+      else buckets.set(key, [item]);
+    });
+    const keepers: { keeper: MediaItem; bucketVariants: string[] }[] = [];
+    buckets.forEach(bucket => {
+      const keeper = pickKeeper(bucket);
+      const bucketVariants: string[] = [];
+      bucket.forEach(item => {
+        if (item === keeper) return;
+        // 同桶 = 同一清晰度的不同 CDN 镜像：补齐主条目字段，并把镜像地址收进
+        // variantUrls 作为兜底，主地址失效时按序降级
+        mergeInto(keeper, item);
+        if (item.url) bucketVariants.push(item.url);
+        dropped.add(item);
+      });
+      keepers.push({ keeper, bucketVariants });
+    });
+    const audioUrls = audio.map(item => item.url);
+    keepers.forEach(({ keeper, bucketVariants }) => {
+      // 已配对的音轨（站点适配层给的）优先保留在前，本轮识别到的排后面；
+      // 本轮识别出 0 条时不能把已有配对覆盖成空数组
+      keeper.audioTrackUrls = mergeAudioTrackUrls(
+        keeper.audioTrackUrls || (keeper.audioTrackUrl ? [keeper.audioTrackUrl] : undefined),
+        audioUrls,
+      );
+      if (keeper.audioTrackUrls.length) keeper.audioTrackUrl = keeper.audioTrackUrls[0];
+      // 兜底链 = 同分辨率镜像 + 同组其它清晰度（主地址失效时按序降级）
+      const others = keepers
+        .filter(o => o.keeper !== keeper)
+        .map(o => o.keeper.url);
+      const merged = dedupeStrings([
+        ...(keeper.variantUrls || []),
+        ...bucketVariants,
+        ...others,
+      ]);
+      if (merged.length) keeper.variantUrls = merged;
+    });
+    // 音轨已被收编，不再单独展示（单独播放没有画面，会被标成「无法播放」）
+    audio.forEach(item => dropped.add(item));
+  });
+
+  // Pass 3：.m4s 轨道容错匹配
   const tracks = new Map<string, MediaItem[]>();
   items.forEach(item => {
     if (item.kind !== 'video' || dropped.has(item)) return;
+    // 站点已声明分组的条目在上面收口过，不走通用折叠
+    if (item.variantGroup) return;
     const key = m4sTrackKeyOf(item.url);
     if (!key) return;
     const group = tracks.get(key);

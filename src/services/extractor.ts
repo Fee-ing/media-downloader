@@ -1,10 +1,14 @@
 /**
  * 注入到 WebView 页面中的采集脚本。
  *
- * 分三步：
- * 1. SHARED_SNIPPET 随页面加载注入，挂载 window.__MD__ 工具集与共用规则；
+ * 分五步：
+ * 1. SHARED_SNIPPET 随页面加载注入，挂载 window.__MD__ 工具集、共用规则与
+ *    站点适配层契约；
  * 2. NET_SNIPPET 立刻安装网络层钩子，覆盖页面加载初期的媒体请求；
- * 3. 页面加载完成（或超时兜底）后调用 window.__MD__.extract() 采集并回传。
+ * 3. SITE_SNIPPET 注册各站点适配层（services/sites/），随后立刻启动它们的
+ *    后台守望——站点数据（如 B 站 playinfo）是延迟写入的，越早开始盯越好；
+ * 4. 页面加载完成（或超时兜底）后调用 window.__MD__.extract() 采集并回传；
+ * 5. 采集时按契约调度站点适配层，把站点特有的信息并入通用结果。
  *
  * 视频采集按「四层漏斗」组织，所有来源最终都汇进同一个 addVideo：
  *
@@ -17,6 +21,9 @@
  * 过去为抖音 / B 站 / 小红书写的专属取数逻辑，本质都是两件对所有站点都成立的事——
  * 「接口响应体里翻直链」与「页面内嵌 STATE 里翻直链」，已由第 ④ 层统一承担。
  *
+ * 真正「只有站点自己说得清」的信息（B 站的 DASH 音画分离与清晰度档位等）交给
+ * 站点适配层 services/sites/，这里只按契约调度，不含任何站点分支。
+ *
  * 对应 FetchV 扩展的：网络层用 webRequest 抓 media/xhr/object/other，
  * 拿不准时回问内容脚本（CHECK_VIDEO_SRC / CHECK_TEXT_CONTENT），
  * 这里则是「网络层拿不全就往 DOM 与接口响应体里翻」，思路一致、手段换成页面内钩子。
@@ -24,6 +31,7 @@
  * 注意：脚本为纯 ES5 风格，避免老旧 WebView 内核语法报错。
  */
 
+import { siteSnippet } from './sites';
 import { PAGE_RULES } from './videoRules';
 
 // ============================================================
@@ -388,6 +396,73 @@ const SHARED_SNIPPET = `(function () {
       } catch (e) {}
     }
     return out;
+  };
+
+  // ---------------------------------------------------------
+  // 站点适配层契约（详见 services/sites/types.ts）
+  //
+  // 通用链路不认识任何具体站点：站点把自己的本事挂到 MD.sites[id] 上，
+  // 这里只按统一时机调度它们——页面加载即启动守望、采集前等待、采集时取数。
+  // 没有注册任何站点时，下面这些函数都是安全的空操作。
+  // ---------------------------------------------------------
+  var sites = (MD.sites = MD.sites || {});
+
+  /**
+   * 站点适配层显式声明的伴音轨地址。
+   *
+   * DASH 的伴音轨多为 .m4s，URL 里既没有 audio 字样、Content-Type 也常是
+   * video/mp4 或 octet-stream，RN 侧靠 URL / 响应头判不出它是音轨，于是：
+   * 音轨可能被选成代表条目（只有声音），或被塞进播放兜底链。
+   * 站点适配层能直接从数据结构里区分（B 站 playinfo 就是 video[] / audio[] 分开的），
+   * 这里把音轨地址登记下来随结果回传，RN 侧据此把同轨的 CDN 镜像也标成伴音轨。
+   * 与具体站点无关，任何适配层都可以调用 MD.declareAudio。
+   */
+  MD.declaredAudioUrls = [];
+  MD.declareAudio = function (u) {
+    try {
+      var full = abs(u);
+      if (!full) { return; }
+      for (var i = 0; i < MD.declaredAudioUrls.length; i++) {
+        if (MD.declaredAudioUrls[i] === full) { return; }
+      }
+      MD.declaredAudioUrls.push(full);
+    } catch (e) {}
+  };
+
+  /** 页面加载即启动各站点的后台守望（幂等，可重复调用） */
+  MD.startSiteWatchers = function () {
+    for (var id in sites) {
+      var site = sites[id];
+      if (!site || typeof site.watch !== 'function') { continue; }
+      try { site.watch(); } catch (e) {}
+    }
+  };
+
+  /** 采集前的最后一次等待：全部站点都就绪（或超时）后才继续 */
+  MD.waitSites = function (timeoutMs) {
+    var jobs = [];
+    for (var id in sites) {
+      var site = sites[id];
+      if (!site || typeof site.wait !== 'function') { continue; }
+      try { jobs.push(site.wait(timeoutMs)); } catch (e) {}
+    }
+    if (!jobs.length) { return Promise.resolve(true); }
+    return Promise.all(jobs).then(function () { return true; })['catch'](function () { return true; });
+  };
+
+  /** 采集阶段调用各站点的 collect，返回按站点 id 归档的诊断信息 */
+  MD.runSites = function (addVideo) {
+    var reports = {};
+    for (var id in sites) {
+      var site = sites[id];
+      if (!site || typeof site.collect !== 'function') { continue; }
+      try {
+        reports[id] = site.collect(addVideo) || null;
+      } catch (e) {
+        reports[id] = { id: id, matched: true, error: String((e && e.message) || e) };
+      }
+    }
+    return reports;
   };
 
   return true;
@@ -776,136 +851,6 @@ const COLLECT_SNIPPET = `(function () {
     } catch (e) { return ''; }
   }
 
-  /**
-   * 从多个可能的位置取出 B 站 DASH 数据。
-   * 现代 B 站页面把播放信息放在 window.__playinfo__（内联 <script>），部分
-   * 场景也会塞进 window.__INITIAL_STATE__ 的 playinfo 字段。两个都尝试。
-   */
-  MD.findBilibiliDash = function () {
-    try {
-      var sources = [];
-      if (window.__playinfo__) { sources.push(window.__playinfo__); }
-      if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.playinfo) {
-        sources.push(window.__INITIAL_STATE__.playinfo);
-      }
-      for (var s = 0; s < sources.length; s++) {
-        var raw = sources[s];
-        if (raw && raw.data && raw.data.dash && raw.data.dash.video && raw.data.dash.video.length) {
-          return raw.data.dash;
-        }
-      }
-    } catch (e) {}
-    return null;
-  };
-
-  /**
-   * 站点适配层显式声明的伴音轨地址。
-   *
-   * DASH 的伴音轨多为 .m4s，URL 里既没有 audio 字样、Content-Type 也常是
-   * video/mp4 或 octet-stream，RN 侧靠 URL / 响应头判不出它是音轨，于是：
-   * 音轨可能被选成代表条目（只有声音），或被塞进播放兜底链。
-   * 站点适配层能直接从数据结构里区分（B 站 playinfo 就是 video[] / audio[] 分开的），
-   * 这里把音轨地址登记下来随结果回传，RN 侧据此把同轨的 CDN 镜像也标成伴音轨。
-   * 与具体站点无关，任何适配层都可以调用 MD.declareAudio。
-   */
-  MD.declaredAudioUrls = [];
-  MD.declareAudio = function (u) {
-    try {
-      var full = abs(u);
-      if (!full) { return; }
-      for (var i = 0; i < MD.declaredAudioUrls.length; i++) {
-        if (MD.declaredAudioUrls[i] === full) { return; }
-      }
-      MD.declaredAudioUrls.push(full);
-    } catch (e) {}
-  };
-
-  /**
-   * B 站专属适配：解析 DASH 音画分离结构。
-   *
-   * B 站视频是 DASH 格式，video[] 与 audio[] 各自独立：
-   *   data.dash.video[].baseUrl  —— 视频轨（.m4s，无声）
-   *   data.dash.audio[].baseUrl  —— 伴音轨（.m4a/.m4s）
-   * 两者在页面里是分离的地址，通用规则只能捞到视频轨，导致「播放无声 +
-   * 下载只得到无声 m4s」。这里直接读取 playinfo，把每条视频轨与全部伴音轨配对
-   * （按带宽从高到低，逐条兜底），通过 audioTrackUrls 一并带回，下游的合并 /
-   * 双轨播放才能生效。
-   *
-   * 只认 bilibili 域名，避免误伤其它站点。返回是否成功拿到数据（供等待循环判断）。
-   */
-  MD.collectBilibiliDash = function (addVideo) {
-    try {
-      if (!/bilibili\.com$/i.test(MD.hostOf(location.href))) { return false; }
-      var dash = MD.findBilibiliDash();
-      if (!dash) { return false; }
-      var videos = dash.video || [];
-      var audios = dash.audio || [];
-      if (!videos.length) { return false; }
-
-      // 全部伴音轨：按带宽从高到低排序，逐个作为下载 / 播放的兜底。
-      // 只留一条时，恰好该节点失效就会「有画面没声音」。
-      var audioList = [];
-      for (var a = 0; a < audios.length; a++) {
-        var au = audios[a];
-        if (!au) { continue; }
-        // baseUrl 在 B 站常被置空，真正的可下载地址在 backupUrl[0]
-        var auUrl = au.baseUrl || (au.backupUrl && au.backupUrl[0]) || au.base_url || au.url;
-        if (!auUrl) { continue; }
-        var bw = parseInt(au.bandwidth || au.BandWidth || 0, 10) || 0;
-        audioList.push({ url: auUrl, bw: bw });
-        // 备用地址也登记为音轨：网络层抓到的常是 backupUrl 里的镜像
-        if (au.backupUrl && au.backupUrl.length) {
-          for (var b = 0; b < au.backupUrl.length; b++) { MD.declareAudio(au.backupUrl[b]); }
-        }
-        MD.declareAudio(auUrl);
-      }
-      audioList.sort(function (x, y) { return y.bw - x.bw; });
-      var audioUrls = [];
-      for (var ai = 0; ai < audioList.length; ai++) { audioUrls.push(audioList[ai].url); }
-
-      for (var v = 0; v < videos.length; v++) {
-        var vv = videos[v];
-        var vUrl = vv && (vv.baseUrl || (vv.backupUrl && vv.backupUrl[0]) || vv.base_url || vv.url);
-        if (!vUrl) { continue; }
-        addVideo({
-          url: vUrl,
-          w: parseInt(vv.width || 0, 10) || 0,
-          h: parseInt(vv.height || 0, 10) || 0,
-          duration: dash.duration ? parseFloat(dash.duration) : undefined,
-          title: document.title || '',
-          source: 'json',
-          audioTrackUrl: audioUrls[0] || undefined,
-          audioTrackUrls: audioUrls.length ? audioUrls.slice() : undefined
-        });
-      }
-      return true;
-    } catch (e) {
-      return false;
-    }
-  };
-
-  /**
-   * 等待 B 站 playinfo 就绪。B 站播放器是延迟初始化的，window.__playinfo__
-   * 可能在页面 load 完成后才写入并填充 data.dash。若 collect 时直接读取为空，
-   * 就轮询等待一段时间再读，确保能拿到音画分离的轨道地址。
-   */
-  MD.waitForBilibiliDash = function (timeoutMs) {
-    return new Promise(function (resolve) {
-      if (!/bilibili\.com$/i.test(MD.hostOf(location.href))) { resolve(false); return; }
-      if (MD.findBilibiliDash()) { resolve(true); return; }
-      var deadline = Date.now() + (timeoutMs || 6000);
-      var timer = window.setInterval(function () {
-        if (MD.findBilibiliDash()) {
-          try { window.clearInterval(timer); } catch (e) {}
-          resolve(true);
-        } else if (Date.now() > deadline) {
-          try { window.clearInterval(timer); } catch (e) {}
-          resolve(false);
-        }
-      }, 300);
-    });
-  };
-
   MD.collect = function () {
     var out = {
       title: document.title || '',
@@ -924,32 +869,22 @@ const COLLECT_SNIPPET = `(function () {
       audioUrls: [],
       images: [],
       videos: [],
-      /** 调试用：B 站音画分离探测结果（仅 bilibili 域名有意义） */
-      biliDebug: null,
+      /** 站点适配层的诊断信息，按站点 id 归档（如 bilibili） */
+      siteDebug: null,
     };
     try { out.cookie = document.cookie || ''; } catch (e) {}
     var adder = MD.adderFor(out);
     var addImage = adder.addImage;
     var addVideo = adder.addVideo;
 
-    // 站点专属适配：B 站 DASH 音画分离，优先把音轨配对进来
+    // 站点适配层：把「只有站点自己说得清」的信息并进来——B 站的 DASH 音画分离、
+    // 清晰度档位、登录态等。通用链路不认识任何站点，只按契约调度，没有任何
+    // 站点注册时这里是空操作。
     try {
-      var dash = MD.findBilibiliDash();
-      var biliVideos = dash ? (dash.video || []).length : 0;
-      var biliAudios = dash ? (dash.audio || []).length : 0;
-      out.biliDebug = {
-        isBili: /bilibili\.com$/i.test(MD.hostOf(location.href)),
-        hasPlayinfo: !!window.__playinfo__,
-        hasInitialState: !!(window.__INITIAL_STATE__),
-        hasDash: !!dash,
-        videoTracks: biliVideos,
-        audioTracks: biliAudios,
-        pickedAudio: biliAudios > 0,
-      };
+      out.siteDebug = MD.runSites(addVideo);
     } catch (e) {
-      out.biliDebug = { error: String((e && e.message) || e) };
+      out.siteDebug = null;
     }
-    MD.collectBilibiliDash(addVideo);
     out.audioUrls = MD.declaredAudioUrls || [];
 
     // ---------- 图片 ----------
@@ -1443,6 +1378,15 @@ const COLLECT_SNIPPET = `(function () {
     ]);
   };
 
+  /**
+   * 采集前留给站点适配层的等待预算。
+   *
+   * 站点的数据（B 站 playinfo）是延迟写入的，多数情况下页面加载即启动的守望
+   * （watch）已经把它拿到手，这里会立刻返回；只有移动端页面这种需要用户交互
+   * 才初始化播放器的场景才会真的等满。给足预算，避免退化成「只抓到当前播放档」。
+   */
+  var SITE_WAIT_MS = 8000;
+
   MD.extract = function () {
     var send = function (payload) {
       try {
@@ -1451,7 +1395,7 @@ const COLLECT_SNIPPET = `(function () {
     };
     try {
       MD.autoScroll(2500)
-        .then(function () { return MD.waitForBilibiliDash(3500); })
+        .then(function () { return MD.waitSites(SITE_WAIT_MS); })
         .then(function () { return MD.collect(); })
         .then(function (res) { return MD.enrich(res); })
         .then(function (res) { send({ __md: 'result', payload: res }); })
@@ -1465,13 +1409,26 @@ const COLLECT_SNIPPET = `(function () {
 })();`;
 
 /**
+/**
+ * 注册完站点适配层后立刻启动它们的后台守望。
+ *
+ * 必须在 SITE_SNIPPET 之后执行：守望要用网络层（MD.net.payloads）与
+ * window.__MD__ 上挂好的工具，而站点又必须尽早开始盯数据，因此单独成一段。
+ */
+const SITE_BOOT_SNIPPET =
+  `(function(){ if (window.__MD__ && window.__MD__.startSiteWatchers) { window.__MD__.startSiteWatchers(); } return true; })();`;
+
+/**
  * 完整注入脚本。
  *
- * 顺序有讲究：NET 必须在 SHARED 之后（依赖它挂好的 window.__MD__ 与规则），
- * 又必须尽量早执行（要覆盖页面加载初期的媒体请求），因此夹在中间。
+ * 顺序有讲究：
+ * 1. SHARED 先挂好 window.__MD__ 与共用规则；
+ * 2. NET 紧随其后安装网络层钩子，才能覆盖页面加载初期的媒体请求；
+ * 3. SITE 注册站点适配层（依赖 NET 的 payload 缓存），并立刻启动守望；
+ * 4. COLLECT 只定义采集函数，等 extract() 时才真正执行。
  */
 export const SETUP_SCRIPT =
-  `${SHARED_SNIPPET}\n${NET_SNIPPET}\n${COLLECT_SNIPPET}`;
+  `${SHARED_SNIPPET}\n${NET_SNIPPET}\n${siteSnippet()}\n${SITE_BOOT_SNIPPET}\n${COLLECT_SNIPPET}`;
 
 /** 触发采集（页面加载完成或超时兜底后调用） */
 export const EXTRACT_SCRIPT = `(function(){ if (window.__MD__ && window.__MD__.extract) { window.__MD__.extract(); } return true; })();`;
