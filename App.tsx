@@ -190,7 +190,6 @@ export default function App() {
       } = await scrapeMedia(payload);
 
       // [诊断] 站点适配层：播放信息来源、清晰度档位、首条视频的音轨与防盗链头
-      console.log('[SITE-DEBUG]', JSON.stringify(stats?.siteDebug || null));
       console.log('[SITE-DEBUG] first video:', nextVideos[0]
         ? JSON.stringify({
             url: nextVideos[0].url?.slice(0, 80),
